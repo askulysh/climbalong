@@ -11,6 +11,7 @@ import re
 import csv
 import os
 import argparse
+import time
 
 # === CONFIGURATION ===
 #city_start = "Chernivtsi, Ukraine"
@@ -24,7 +25,7 @@ city_end = "Leonidio, Greece"
 #city_end = "Arco"
 #city_end = "Giurgiu"
 #city_end = "Chernivtsi, Ukraine"
-buffer_km = 30  # distance around route to search for crags
+buffer_km = 10  # distance around route to search for crags
 max_distance_m = 10
 consumption = 7.5
 fuel_cost = 1.4
@@ -122,7 +123,146 @@ def toll_update(nearby_tolls) :
         print(f"💾 CSV updated: {csv_filename}")
 
 
-def calc_toll_cost(min_lat, min_lon, max_lat, max_lon, route, route_bulffer, fmap) :
+NOMINATIM_HEADERS = {"User-Agent": "route-climbing-fetcher"}
+VIGNETTE_SAMPLE_KM = 40
+VIGNETTE_MAX_SAMPLES = 25
+
+
+def vignette_load(csv_filename):
+    """Load vignette fees keyed by ISO country code."""
+    vignettes = {}
+    if not os.path.exists(csv_filename):
+        return vignettes
+    with open(csv_filename, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                code = row["country_code"].strip().upper()
+                fee = float(row["fee"])
+                name = row.get("country", code)
+                currency = row.get("currency", "EUR")
+                vignettes[code] = {"fee": fee, "country": name, "currency": currency}
+            except (ValueError, KeyError):
+                continue
+    print(f"📂 Loaded {len(vignettes)} vignette prices from {csv_filename}")
+    return vignettes
+
+
+def reverse_country(lon, lat, cache):
+    """Reverse-geocode a point; return (country_code, country_name) or None."""
+    key = (round(lat, 3), round(lon, 3))
+    if key in cache:
+        return cache[key]
+    url = "https://nominatim.openstreetmap.org/reverse"
+    params = {"lat": lat, "lon": lon, "format": "json"}
+    resp = requests.get(url, params=params, headers=NOMINATIM_HEADERS)
+    resp.raise_for_status()
+    data = resp.json()
+    address = data.get("address", {})
+    code = address.get("country_code", "").upper()
+    name = address.get("country", code)
+    result = (code, name) if code else None
+    cache[key] = result
+    return result
+
+
+def sample_route_points(route_coords, interval_km=VIGNETTE_SAMPLE_KM,
+                        max_samples=VIGNETTE_MAX_SAMPLES):
+    """Return (lon, lat) sample points along the route polyline."""
+    route_line = LineString(route_coords)
+    project = pyproj.Transformer.from_crs("epsg:4326", "epsg:3857",
+                                          always_xy=True).transform
+    unproject = pyproj.Transformer.from_crs("epsg:3857", "epsg:4326",
+                                          always_xy=True).transform
+    route_proj = transform(project, route_line)
+    length_m = route_proj.length
+    if length_m == 0:
+        lon, lat = route_coords[0]
+        return [(lon, lat)]
+
+    interval_m = interval_km * 1000
+    distances = [0.0]
+    d = interval_m
+    while d < length_m:
+        distances.append(d)
+        d += interval_m
+    if distances[-1] < length_m:
+        distances.append(length_m)
+
+    if len(distances) > max_samples:
+        step = max(1, len(distances) // max_samples)
+        distances = distances[::step]
+        if distances[-1] != length_m:
+            distances.append(length_m)
+
+    points = []
+    for dist in distances:
+        pt = route_proj.interpolate(dist)
+        lon, lat = transform(unproject, pt).coords[0]
+        points.append((lon, lat))
+    return points
+
+
+def countries_on_route(route_coords, geocode_cache=None):
+    """Detect unique countries crossed by sampling the route."""
+    samples = sample_route_points(route_coords)
+    cache = geocode_cache if geocode_cache is not None else {}
+    countries = {}
+    for i, (lon, lat) in enumerate(samples):
+        if i > 0:
+            time.sleep(1.1)
+        result = reverse_country(lon, lat, cache)
+        if result:
+            code, name = result
+            countries[code] = name
+    return countries
+
+
+def calc_vignette_cost(route_coords, csv_path="vignettes.csv", vignettes=None,
+                       geocode_cache=None, label=None):
+    """Compute vignette cost for countries crossed (one fee per country)."""
+    if vignettes is None:
+        vignettes = vignette_load(csv_path)
+    if not vignettes:
+        print(f"⚠ No vignette data in {csv_path}")
+        return 0.0
+
+    if label is not None:
+        print(f"\n--- Route {label}: vignettes ---")
+    print("Detecting countries along route (Nominatim)...")
+    countries = countries_on_route(route_coords, geocode_cache)
+    if not countries:
+        print("No countries detected on route.")
+        return 0.0
+
+    codes_sorted = sorted(countries.keys())
+    print(f"Countries on route: {', '.join(codes_sorted)}")
+    print("(Vignette prices are editable in vignettes.csv)")
+
+    total = 0.0
+    currency = "EUR"
+    charged = []
+    for code in codes_sorted:
+        name = countries[code]
+        if code in vignettes:
+            entry = vignettes[code]
+            fee = entry["fee"]
+            currency = entry.get("currency", "EUR")
+            if fee > 0:
+                charged.append((name, code, fee, currency))
+                total += fee
+        else:
+            print(f"  ⚠ crossed {name} ({code}) — no vignette price in {csv_path}")
+
+    if charged:
+        print("Vignettes:")
+        for name, code, fee, cur in charged:
+            print(f"  • {name} ({code}) — {fee:.2f} {cur}")
+    print(f"Total vignette cost: {total:.2f} {currency}")
+    return total
+
+
+def calc_toll_cost(route, fmap=None, known_tolls=None, label=None):
     # Simplify the route to keep the query string length reasonable for Overpass API
     route_line = LineString(route)
     simplified_route = route_line.simplify(0.0015, preserve_topology=False)
@@ -173,7 +313,8 @@ def calc_toll_cost(min_lat, min_lon, max_lat, max_lon, route, route_bulffer, fma
                 return float(match.group(1)), currency
         return 0, currency
 
-    known_tolls = toll_load("jumper_tolls.csv")
+    if known_tolls is None:
+        known_tolls = toll_load("jumper_tolls.csv")
     nearby_tolls = []
     total_cost = 0.0
     for el in elements:
@@ -205,7 +346,8 @@ def calc_toll_cost(min_lat, min_lon, max_lat, max_lon, route, route_bulffer, fma
         total_cost += fee
 
     toll_update(nearby_tolls)
-    # === Step 7: Output summary ===
+    if label is not None:
+        print(f"\n--- Route {label}: tolls ---")
     print(f"Toll booths found: {len(nearby_tolls)}")
     for t in nearby_tolls:
         print(f"  • {t['name']} ({t['lat']:.4f},{t['lon']:.4f}) — {t['fee']} {t['currency']}")
@@ -227,6 +369,7 @@ def calc_toll_cost(min_lat, min_lon, max_lat, max_lon, route, route_bulffer, fma
                 icon=folium.Icon(color="blue", icon="road", prefix="fa")
             ).add_to(fmap)
 
+    return total_cost
 
 
 if __name__ == "__main__":
@@ -239,6 +382,8 @@ if __name__ == "__main__":
                         help="CSV file to store toll data")
     parser.add_argument("--no-map", action="store_true",
                         help="Disable map output")
+    parser.add_argument("--vignettes-csv", default="vignettes.csv",
+                        help="CSV file with per-country vignette prices")
     args = parser.parse_args()
 
     city_start = args.start_city
@@ -324,15 +469,32 @@ if __name__ == "__main__":
         referrerPolicy="no-referrer-when-downgrade"
     ).add_to(m)
 
-    calc_toll_cost(min_lat, min_lon, max_lat, max_lon, route, route_buffer, m)
+    fmap = None if args.no_map else m
+    known_tolls = toll_load("jumper_tolls.csv")
+    vignettes = vignette_load(args.vignettes_csv)
+    geocode_cache = {}
+    route_colors = ["blue", "orange", "purple", "red"]
 
-    for r in routes :
-        print("distance:", r["distance"]/1000,
-              "duration:", r["duration"]/60/60)
-        route_ = ([(lat, lon) for lon, lat in r["geometry"]["coordinates"]])
-        # Route line
-        folium.PolyLine(route_, color="blue", weight=3, opacity=0.8,
-                        tooltip="Route").add_to(m)
+    for i, r in enumerate(routes):
+        route_coords = r["geometry"]["coordinates"]
+        label = i + 1
+        dist_km = r["distance"] / 1000
+        dur_h = r["duration"] / 60 / 60
+        print(f"\n=== Route {label} ===")
+        print(f"distance: {dist_km:.1f} km, duration: {dur_h:.2f} h")
+
+        route_fmap = fmap if i == 0 else None
+        toll_total = calc_toll_cost(route_coords, route_fmap, known_tolls, label)
+        vignette_total = calc_vignette_cost(
+            route_coords, vignettes=vignettes,
+            geocode_cache=geocode_cache, label=label)
+        print(f"Total travel cost (tolls + vignettes): "
+              f"{toll_total + vignette_total:.2f} EUR")
+
+        route_ = [(lat, lon) for lon, lat in route_coords]
+        color = route_colors[i % len(route_colors)]
+        folium.PolyLine(route_, color=color, weight=3, opacity=0.8,
+                        tooltip=f"Route {label}").add_to(m)
 
     # Buffer polygon (approximate)
     buffer_coords = list(route_buffer.exterior.coords)
