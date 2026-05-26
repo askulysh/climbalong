@@ -1,0 +1,381 @@
+#!/usr/bin/python3
+
+import requests
+from shapely.geometry import LineString, Point
+from shapely.ops import transform
+import pyproj
+import folium
+import urllib.parse
+import xml.etree.ElementTree as ET
+import re
+import csv
+import os
+import argparse
+
+# === CONFIGURATION ===
+#city_start = "Chernivtsi, Ukraine"
+city_start = "Giurgiu"
+#city_start = "Arta, Greece"
+#city_start ="Athens, Greece"
+#city_end = "Paradisos, Greece"
+#city_start = "Paradisos, Greece"
+city_end = "Leonidio, Greece"
+#city_end = "Antalya"
+#city_end = "Arco"
+#city_end = "Giurgiu"
+#city_end = "Chernivtsi, Ukraine"
+buffer_km = 30  # distance around route to search for crags
+max_distance_m = 10
+consumption = 7.5
+fuel_cost = 1.4
+
+#routes = 3
+
+# === STEP 1: Geocode cities (Nominatim) ===
+def geocode(city_name):
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {"q": city_name, "format": "json", "limit": 1}
+    resp = requests.get(url, params=params,
+                        headers={"User-Agent": "route-climbing-fetcher"})
+    resp.raise_for_status()
+    data = resp.json()
+    if not data:
+        raise ValueError(f"City not found: {city_name}")
+    return float(data[0]["lon"]), float(data[0]["lat"])
+
+def save_crags_to_gpx(crags, filename):
+    gpx = ET.Element("gpx", version="1.1", creator="ClimbingRouteFinder",
+                     xmlns="http://www.topografix.com/GPX/1/1")
+    for el in crags:
+        name = el.get("tags", {}).get("name", f"crag_{el['id']}")
+        lat = el.get("lat") or el.get("center", {}).get("lat")
+        lon = el.get("lon") or el.get("center", {}).get("lon")
+        if lat is None or lon is None:
+            continue
+        wpt = ET.SubElement(gpx, "wpt", lat=str(lat), lon=str(lon))
+        ET.SubElement(wpt, "name").text = name
+        ET.SubElement(wpt, "desc").text = f"https://www.openstreetmap.org/{el['type']}/{el['id']}"
+    tree = ET.ElementTree(gpx)
+    tree.write(filename, encoding="utf-8", xml_declaration=True)
+    print(f"✅ GPX file saved: {filename}")
+
+
+def toll_save(details, csv_filename) :
+    with open(csv_filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["id", "name", "lat", "lon",
+                                               "fee", "currency"])
+        writer.writeheader()
+#        writer.writerows(details)
+        for t in details.values():
+            writer.writerow({
+                "id": t["id"],
+                "name": t["name"],
+                "lat": t["lat"],
+                "lon": t["lon"],
+                "fee": t["fee"],
+                "currency": "EUR"
+                })
+
+def toll_load(csv_filename):
+    known_tolls = {}
+    if os.path.exists(csv_filename):
+        with open(csv_filename, newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    node_id = int(row["id"])
+                    fee_val = float(row["fee"])
+                    known_tolls[node_id] = fee_val
+                except (ValueError, KeyError):
+                    continue
+        print(f"📂 Loaded {len(known_tolls)} tolls from {csv_filename}")
+    return known_tolls
+
+def toll_update(nearby_tolls) :
+    # Merge known_tolls with newly found
+    updated = {t["id"]: t for t in nearby_tolls}
+    # Load old data if exists
+    csv_filename = "jumper_tolls.csv"
+    if os.path.exists(csv_filename):
+        with open(csv_filename, newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                node_id = int(row["id"])
+                if node_id not in updated:
+                    updated[node_id] = row
+
+        # Save updated data
+        csv_filename = "tolls.csv"
+        with open(csv_filename, "w", newline='', encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["id", "name", "lat", "lon",
+                                                   "fee", "currency"])
+            writer.writeheader()
+            for t in updated.values():
+                writer.writerow({
+                    "id": t["id"],
+                    "name": t["name"],
+                    "lat": t["lat"],
+                    "lon": t["lon"],
+                    "fee": t["fee"],
+                    "currency" : "EUR"
+                })
+        print(f"💾 CSV updated: {csv_filename}")
+
+
+def calc_toll_cost(min_lat, min_lon, max_lat, max_lon, route, route_bulffer, fmap) :
+    # Simplify the route to keep the query string length reasonable for Overpass API
+    route_line = LineString(route)
+    simplified_route = route_line.simplify(0.0015, preserve_topology=False)
+    
+    # Overpass 'around' filter uses (latitude, longitude) format
+    coords_str = ",".join(f"{lat:.6f},{lon:.6f}" for lon, lat in simplified_route.coords)
+    
+    overpass_url = "https://overpass-api.de/api/interpreter"
+    query = f"""
+    [out:json][timeout:60];
+    node["barrier"="toll_booth"](around:150,{coords_str});
+    out body;
+    """
+    resp = requests.post(overpass_url, data={"data": query},
+                         headers={"User-Agent": "route-climbing-fetcher"})
+    resp.raise_for_status()
+    elements = resp.json().get("elements", [])
+
+    project = pyproj.Transformer.from_crs("epsg:4326", "epsg:3857",
+                                          always_xy=True).transform
+    route_proj = transform(project,  LineString(route))
+
+    def distance_m(lon, lat):
+        p = transform(project, Point(lon, lat))
+        return route_proj.distance(p)  # distance in meters (because EPSG:3857)
+
+    toll_booths = [el for el in elements if distance_m(el["lon"], el["lat"]) <= max_distance_m]
+
+    # === Step 6: Parse fee values ===
+    def parse_fee(tags):
+        """Extract numeric fee or interpret 'yes'."""
+        name = tags.get("name")
+        fee = tags.get("fee")
+        currency = tags.get("fee:currency", "EUR")
+        charge = tags.get("charge")
+        if charge :
+            match = re.search(r"(\d+(\.\d+)?)", charge)
+            if match:
+                return float(match.group(1)), currency
+        if fee:
+            # Extract numeric part
+            match = re.search(r"(\d+(\.\d+)?)", fee)
+            if match:
+                return float(match.group(1)), currency
+        if name :
+            match = re.search(r"(\d+(\.\d+)?)", name.replace(',', '.'))
+            if match:
+                return float(match.group(1)), currency
+        return 0, currency
+
+    known_tolls = toll_load("jumper_tolls.csv")
+    nearby_tolls = []
+    total_cost = 0.0
+    for el in elements:
+        lon, lat = el["lon"], el["lat"]
+        node_id = int(el["id"])
+        if distance_m(lon, lat) > max_distance_m:
+            continue
+
+        tags = el.get("tags", {})
+        name = tags.get("name", "(unnamed)")
+
+        if node_id in known_tolls:
+            fee = known_tolls[node_id]
+            currency = "EUR"
+            source = "CSV"
+        else:
+            fee, currency = parse_fee(tags)
+            source = "OSM"
+
+        nearby_tolls.append({
+            "id": node_id,
+            "name": name,
+            "lat": lat,
+            "lon": lon,
+            "fee": fee,
+            "source": source,
+            "currency": currency
+        })
+        total_cost += fee
+
+    toll_update(nearby_tolls)
+    # === Step 7: Output summary ===
+    print(f"Toll booths found: {len(nearby_tolls)}")
+    for t in nearby_tolls:
+        print(f"  • {t['name']} ({t['lat']:.4f},{t['lon']:.4f}) — {t['fee']} {t['currency']}")
+    print(f"Total toll cost: {total_cost:.2f}" )
+
+
+    if fmap :
+        for t in nearby_tolls:
+            osm_link = f"https://www.openstreetmap.org/node/{t['id']}"
+            popup_html = f"""
+            <b>{t['name']}</b><br>
+            Fee: {t['fee']} {t['currency']}<br>
+            <a href="{osm_link}" target="_blank">OpenStreetMap</a>
+            """
+            folium.Marker(
+                [t["lat"], t["lon"]],
+                popup=popup_html,
+                tooltip=f"{t['name']} ({t['fee']} {t['currency']})",
+                icon=folium.Icon(color="blue", icon="road", prefix="fa")
+            ).add_to(fmap)
+
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Calculate toll cost between two cities using OSM data.")
+    parser.add_argument("start_city", help="Name of the start city")
+    parser.add_argument("end_city", help="Name of the end city")
+    parser.add_argument("--buffer", type=float, default=10,
+                        help="Buffer distance (m) around route to count tolls")
+    parser.add_argument("--csv", default="tolls.csv",
+                        help="CSV file to store toll data")
+    parser.add_argument("--no-map", action="store_true",
+                        help="Disable map output")
+    args = parser.parse_args()
+
+    city_start = args.start_city
+    city_end = args.end_city
+
+    start_lon, start_lat = geocode(city_start)
+    end_lon, end_lat = geocode(city_end)
+    print(f"Route: {city_start} → {city_end}")
+
+
+    # === STEP 2: Get route polyline via OSRM ===
+    osrm_url = f"https://router.project-osrm.org/route/v1/driving/{start_lon},{start_lat};{end_lon},{end_lat}"
+    resp = requests.get(osrm_url, params={"overview": "full", "geometries":
+                                      "geojson", "alternatives": "3" },
+                        headers={"User-Agent": "route-climbing-fetcher"})
+    resp.raise_for_status()
+    route = resp.json()["routes"][0]["geometry"]["coordinates"]
+    route_line = LineString([(lon, lat) for lon, lat in route])
+    routes = resp.json()["routes"]
+
+    # === STEP 3: Create buffer around route ===
+    project = pyproj.Transformer.from_crs("epsg:4326", "epsg:3857",
+                                          always_xy=True).transform
+    route_buffer = transform(project, route_line).buffer(buffer_km * 1000)
+    unproject = pyproj.Transformer.from_crs("epsg:3857", "epsg:4326",
+                                            always_xy=True).transform
+    route_buffer = transform(unproject, route_buffer)
+
+    min_lon, min_lat, max_lon, max_lat = route_buffer.bounds
+
+
+    # === STEP 4: Query Overpass API ===
+    overpass_url = "https://overpass-api.de/api/interpreter"
+    query = f"""
+    [out:json][timeout:60];
+    (
+      node["climbing"="crag"]({min_lat},{min_lon},{max_lat},{max_lon});
+      node["sport"="climbing"]({min_lat},{min_lon},{max_lat},{max_lon});
+      way["climbing"="crag"]({min_lat},{min_lon},{max_lat},{max_lon});
+      way["sport"="climbing"]({min_lat},{min_lon},{max_lat},{max_lon});
+      relation["climbing"="crag"]({min_lat},{min_lon},{max_lat},{max_lon});
+    );
+    out center;
+    """
+
+    resp = requests.post(overpass_url, data={'data': query},
+                         headers={"User-Agent": "route-climbing-fetcher"})
+    resp.raise_for_status()
+    elements = resp.json()["elements"]
+
+
+    # === STEP 5: Filter to only those inside buffer ===
+    def is_in_buffer(el):
+        lat = el.get("lat") or el.get("center", {}).get("lat")
+        lon = el.get("lon") or el.get("center", {}).get("lon")
+        if lat is None or lon is None:
+            return False
+        return route_buffer.contains(Point(lon, lat))
+
+
+    crags = [el for el in elements if is_in_buffer(el)]
+    print(f"Found {len(crags)} climbing crags along the route.")
+
+
+    # === STEP 6: Create map ===
+    center_lat = (start_lat + end_lat) / 2
+    center_lon = (start_lon + end_lon) / 2
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=6,
+                   tiles=None)
+    
+    # CartoDB Positron: Beautiful, fast, and fully compatible with local file (file://) protocol viewing
+    folium.TileLayer(
+        tiles="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+        name="CartoDB Positron (Local File Compatible)",
+        attr='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
+    ).add_to(m)
+    
+    # Standard OpenStreetMap: Requires a local web server (e.g. python -m http.server) to satisfy Referer checks
+    folium.TileLayer(
+        tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        name="OpenStreetMap (Requires Web Server)",
+        attr='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+        referrerPolicy="no-referrer-when-downgrade"
+    ).add_to(m)
+
+    calc_toll_cost(min_lat, min_lon, max_lat, max_lon, route, route_buffer, m)
+
+    for r in routes :
+        print("distance:", r["distance"]/1000,
+              "duration:", r["duration"]/60/60)
+        route_ = ([(lat, lon) for lon, lat in r["geometry"]["coordinates"]])
+        # Route line
+        folium.PolyLine(route_, color="blue", weight=3, opacity=0.8,
+                        tooltip="Route").add_to(m)
+
+    # Buffer polygon (approximate)
+    buffer_coords = list(route_buffer.exterior.coords)
+    folium.Polygon([(lat, lon) for lon, lat in buffer_coords],
+               color="green", weight=1, fill=True, fill_opacity=0.1,
+               tooltip=f"Search area ±{buffer_km} km").add_to(m)
+
+    # === STEP 7: Add markers for crags ===
+    for el in crags:
+        tags = el.get("tags", {})
+        name = tags.get("int_name", tags.get("name:en", tags.get("name",
+                                                             "Unnamed crag")))
+        lat = el.get("lat") or el.get("center", {}).get("lat")
+        lon = el.get("lon") or el.get("center", {}).get("lon")
+
+        osm_url = f"https://www.openstreetmap.org/{el['type']}/{el['id']}"
+        query_name = urllib.parse.quote(name)
+        thecrag_url = tags.get("climbing:url:thecrag",
+                    f"https://www.thecrag.com/search?S={query_name}#crags")
+        a8nu_url = f"https://www.8a.nu/search/crags?query={query_name}"
+
+        popup_html = f"""
+        <b>{name}</b><br>
+        📍 {lat:.4f}, {lon:.4f}<br>
+        <a href="{osm_url}" target="_blank">OpenStreetMap</a> |
+        <a href="{thecrag_url}" target="_blank">TheCrag</a> |
+        <a href="{a8nu_url}" target="_blank">8a.nu</a>
+        """
+        folium.Marker(
+            [lat, lon],
+            popup=folium.Popup(popup_html, max_width=300),
+            icon=folium.Icon(color="red", icon="flag")
+        ).add_to(m)
+
+    # Start & end markers
+    folium.Marker([start_lat, start_lon], popup=f"Start: {city_start}",
+                  icon=folium.Icon(color="green")).add_to(m)
+    folium.Marker([end_lat, end_lon], popup=f"End: {city_end}",
+                  icon=folium.Icon(color="blue")).add_to(m)
+
+    # === STEP 8: Save map ===
+    folium.LayerControl().add_to(m)
+    m.save("climbing_crags_route.html")
+    print("✅ Map saved to climbing_crags_route.html")
+
+    save_crags_to_gpx(crags, "crags.gpx")
