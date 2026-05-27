@@ -2,7 +2,7 @@
 
 import requests
 from shapely.geometry import LineString, Point
-from shapely.ops import transform
+from shapely.ops import substring, transform
 import pyproj
 import folium
 import urllib.parse
@@ -25,10 +25,17 @@ city_end = "Leonidio, Greece"
 #city_end = "Arco"
 #city_end = "Giurgiu"
 #city_end = "Chernivtsi, Ukraine"
-buffer_km = 10  # distance around route to search for crags
+buffer_km = 10  # default distance around route to search for crags (km)
 max_distance_m = 10
 consumption = 7.5
 fuel_cost = 1.4
+
+CRAG_SEGMENT_KM = 250
+OVERPASS_URLS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+]
+OVERPASS_HEADERS = {"User-Agent": "route-climbing-fetcher"}
 
 #routes = 3
 
@@ -121,6 +128,144 @@ def toll_update(nearby_tolls) :
                     "currency" : "EUR"
                 })
         print(f"💾 CSV updated: {csv_filename}")
+
+
+def overpass_post(query, timeout=90, max_retries=3):
+    """POST to Overpass with retries and mirror fallback."""
+    if "[timeout:" in query:
+        query = re.sub(r"\[timeout:\d+\]", f"[timeout:{timeout}]", query)
+    elif query.lstrip().startswith("[out:json]"):
+        query = re.sub(r"\[out:json\]", f"[out:json][timeout:{timeout}]", query, count=1)
+    else:
+        query = f"[out:json][timeout:{timeout}];\n{query}"
+
+    last_error = None
+    for url in OVERPASS_URLS:
+        for attempt in range(max_retries):
+            try:
+                resp = requests.post(
+                    url, data={"data": query}, headers=OVERPASS_HEADERS,
+                    timeout=timeout + 30)
+                if resp.status_code in (429, 503, 504):
+                    resp.raise_for_status()
+                resp.raise_for_status()
+                return resp.json().get("elements", [])
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+        time.sleep(1)
+
+    raise RuntimeError(
+        f"Overpass query failed after {len(OVERPASS_URLS)} mirrors: {last_error}"
+    ) from last_error
+
+
+def iter_route_segments(route_coords, segment_km=CRAG_SEGMENT_KM):
+    """Yield route coordinate lists for each ~segment_km slice."""
+    route_line = LineString(route_coords)
+    if route_line.is_empty:
+        return
+
+    project = pyproj.Transformer.from_crs("epsg:4326", "epsg:3857",
+                                          always_xy=True).transform
+    unproject = pyproj.Transformer.from_crs("epsg:3857", "epsg:4326",
+                                            always_xy=True).transform
+    route_proj = transform(project, route_line)
+    length_m = route_proj.length
+    if length_m == 0:
+        yield route_coords
+        return
+
+    segment_m = segment_km * 1000
+    start = 0.0
+    while start < length_m:
+        end = min(start + segment_m, length_m)
+        seg_proj = substring(route_proj, start, end)
+        seg_wgs = transform(unproject, seg_proj)
+        coords = list(seg_wgs.coords)
+        if coords:
+            yield coords
+        start = end
+
+
+def _crag_bbox_query(min_lat, min_lon, max_lat, max_lon, timeout=90):
+    return f"""
+    [out:json][timeout:{timeout}];
+    (
+      node["climbing"="crag"]({min_lat},{min_lon},{max_lat},{max_lon});
+      node["sport"="climbing"]({min_lat},{min_lon},{max_lat},{max_lon});
+      way["climbing"="crag"]({min_lat},{min_lon},{max_lat},{max_lon});
+      way["sport"="climbing"]({min_lat},{min_lon},{max_lat},{max_lon});
+      relation["climbing"="crag"]({min_lat},{min_lon},{max_lat},{max_lon});
+    );
+    out center;
+    """
+
+
+def fetch_crags_along_route(route_coords, buffer_km, segment_km=CRAG_SEGMENT_KM):
+    """Fetch climbing features along route using chunked Overpass bbox queries."""
+    project = pyproj.Transformer.from_crs("epsg:4326", "epsg:3857",
+                                          always_xy=True).transform
+    unproject = pyproj.Transformer.from_crs("epsg:3857", "epsg:4326",
+                                            always_xy=True).transform
+    merged = {}
+    segments = list(iter_route_segments(route_coords, segment_km))
+    total = len(segments)
+
+    for i, seg_coords in enumerate(segments):
+        print(f"Crag segment {i + 1}/{total}...")
+        seg_line = LineString(seg_coords)
+        seg_buffer = transform(
+            unproject, transform(project, seg_line).buffer(buffer_km * 1000))
+        min_lon, min_lat, max_lon, max_lat = seg_buffer.bounds
+        query = _crag_bbox_query(min_lat, min_lon, max_lat, max_lon)
+        elements = overpass_post(query)
+        for el in elements:
+            merged[(el["type"], el["id"])] = el
+
+    return list(merged.values())
+
+
+def _toll_around_coords(route_coords):
+    """Build capped lat,lon list for Overpass around filter."""
+    route_line = LineString(route_coords)
+    project = pyproj.Transformer.from_crs("epsg:4326", "epsg:3857",
+                                          always_xy=True).transform
+    route_proj = transform(project, route_line)
+    length_km = route_proj.length / 1000
+    tolerance = 0.0015
+    simplified = route_line.simplify(tolerance, preserve_topology=False)
+    coords = list(simplified.coords)
+    return coords
+
+
+def _fetch_toll_elements(route_coords):
+    """Query toll booths along route; segment on failure."""
+    coords = _toll_around_coords(route_coords)
+    coords_str = ",".join(f"{lat:.6f},{lon:.6f}" for lon, lat in coords)
+    query = f"""
+    [out:json][timeout:90];
+    node["barrier"="toll_booth"](around:150,{coords_str});
+    out body;
+    """
+    try:
+        return overpass_post(query)
+    except RuntimeError:
+        merged = {}
+        segments = list(iter_route_segments(route_coords))
+        print(f"Toll query split into {len(segments)} segments...")
+        for seg_coords in segments:
+            seg_coords_list = _toll_around_coords(seg_coords)
+            seg_str = ",".join(f"{lat:.6f},{lon:.6f}" for lon, lat in seg_coords_list)
+            seg_query = f"""
+            [out:json][timeout:90];
+            node["barrier"="toll_booth"](around:150,{seg_str});
+            out body;
+            """
+            for el in overpass_post(seg_query):
+                merged[el["id"]] = el
+        return list(merged.values())
 
 
 NOMINATIM_HEADERS = {"User-Agent": "route-climbing-fetcher"}
@@ -263,23 +408,7 @@ def calc_vignette_cost(route_coords, csv_path="vignettes.csv", vignettes=None,
 
 
 def calc_toll_cost(route, fmap=None, known_tolls=None, label=None):
-    # Simplify the route to keep the query string length reasonable for Overpass API
-    route_line = LineString(route)
-    simplified_route = route_line.simplify(0.0015, preserve_topology=False)
-    
-    # Overpass 'around' filter uses (latitude, longitude) format
-    coords_str = ",".join(f"{lat:.6f},{lon:.6f}" for lon, lat in simplified_route.coords)
-    
-    overpass_url = "https://overpass-api.de/api/interpreter"
-    query = f"""
-    [out:json][timeout:60];
-    node["barrier"="toll_booth"](around:150,{coords_str});
-    out body;
-    """
-    resp = requests.post(overpass_url, data={"data": query},
-                         headers={"User-Agent": "route-climbing-fetcher"})
-    resp.raise_for_status()
-    elements = resp.json().get("elements", [])
+    elements = _fetch_toll_elements(route)
 
     project = pyproj.Transformer.from_crs("epsg:4326", "epsg:3857",
                                           always_xy=True).transform
@@ -288,8 +417,6 @@ def calc_toll_cost(route, fmap=None, known_tolls=None, label=None):
     def distance_m(lon, lat):
         p = transform(project, Point(lon, lat))
         return route_proj.distance(p)  # distance in meters (because EPSG:3857)
-
-    toll_booths = [el for el in elements if distance_m(el["lon"], el["lat"]) <= max_distance_m]
 
     # === Step 6: Parse fee values ===
     def parse_fee(tags):
@@ -377,7 +504,7 @@ if __name__ == "__main__":
     parser.add_argument("start_city", help="Name of the start city")
     parser.add_argument("end_city", help="Name of the end city")
     parser.add_argument("--buffer", type=float, default=10,
-                        help="Buffer distance (m) around route to count tolls")
+                        help="Buffer distance (km) around route for crag search")
     parser.add_argument("--csv", default="tolls.csv",
                         help="CSV file to store toll data")
     parser.add_argument("--no-map", action="store_true",
@@ -388,6 +515,7 @@ if __name__ == "__main__":
 
     city_start = args.start_city
     city_end = args.end_city
+    search_buffer_km = args.buffer
 
     start_lon, start_lat = geocode(city_start)
     end_lon, end_lat = geocode(city_end)
@@ -407,33 +535,13 @@ if __name__ == "__main__":
     # === STEP 3: Create buffer around route ===
     project = pyproj.Transformer.from_crs("epsg:4326", "epsg:3857",
                                           always_xy=True).transform
-    route_buffer = transform(project, route_line).buffer(buffer_km * 1000)
+    route_buffer = transform(project, route_line).buffer(search_buffer_km * 1000)
     unproject = pyproj.Transformer.from_crs("epsg:3857", "epsg:4326",
                                             always_xy=True).transform
     route_buffer = transform(unproject, route_buffer)
 
-    min_lon, min_lat, max_lon, max_lat = route_buffer.bounds
-
-
-    # === STEP 4: Query Overpass API ===
-    overpass_url = "https://overpass-api.de/api/interpreter"
-    query = f"""
-    [out:json][timeout:60];
-    (
-      node["climbing"="crag"]({min_lat},{min_lon},{max_lat},{max_lon});
-      node["sport"="climbing"]({min_lat},{min_lon},{max_lat},{max_lon});
-      way["climbing"="crag"]({min_lat},{min_lon},{max_lat},{max_lon});
-      way["sport"="climbing"]({min_lat},{min_lon},{max_lat},{max_lon});
-      relation["climbing"="crag"]({min_lat},{min_lon},{max_lat},{max_lon});
-    );
-    out center;
-    """
-
-    resp = requests.post(overpass_url, data={'data': query},
-                         headers={"User-Agent": "route-climbing-fetcher"})
-    resp.raise_for_status()
-    elements = resp.json()["elements"]
-
+    # === STEP 4: Query Overpass API (chunked along route) ===
+    elements = fetch_crags_along_route(route, search_buffer_km)
 
     # === STEP 5: Filter to only those inside buffer ===
     def is_in_buffer(el):
@@ -500,7 +608,7 @@ if __name__ == "__main__":
     buffer_coords = list(route_buffer.exterior.coords)
     folium.Polygon([(lat, lon) for lon, lat in buffer_coords],
                color="green", weight=1, fill=True, fill_opacity=0.1,
-               tooltip=f"Search area ±{buffer_km} km").add_to(m)
+               tooltip=f"Search area ±{search_buffer_km} km").add_to(m)
 
     # === STEP 7: Add markers for crags ===
     for el in crags:
