@@ -402,8 +402,6 @@ def countries_on_route(route_coords, geocode_cache=None):
     cache = geocode_cache if geocode_cache is not None else {}
     countries = {}
     for i, (lon, lat) in enumerate(samples):
-        if i > 0:
-            time.sleep(1.1)
         result = reverse_country(lon, lat, cache)
         if result:
             code, name = result
