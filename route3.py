@@ -293,6 +293,54 @@ def vignette_load(csv_filename):
     return vignettes
 
 
+def geocode_cache_load(csv_filename):
+    """Load reverse-geocode cache keyed by (lat, lon) rounded to 3 decimals."""
+    cache = {}
+    if not os.path.exists(csv_filename):
+        return cache
+    with open(csv_filename, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                lat = round(float(row["lat"]), 3)
+                lon = round(float(row["lon"]), 3)
+                code = row.get("country_code", "").strip().upper()
+                name = row.get("country", "").strip()
+                if code:
+                    cache[(lat, lon)] = (code, name or code)
+                else:
+                    cache[(lat, lon)] = None
+            except (ValueError, KeyError):
+                continue
+    print(f"📂 Loaded {len(cache)} geocode entries from {csv_filename}")
+    return cache
+
+
+def geocode_cache_save(cache, csv_filename):
+    """Persist reverse-geocode cache to CSV."""
+    with open(csv_filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["lat", "lon", "country_code", "country"])
+        writer.writeheader()
+        for (lat, lon), result in sorted(cache.items()):
+            if result:
+                code, name = result
+                writer.writerow({
+                    "lat": lat,
+                    "lon": lon,
+                    "country_code": code,
+                    "country": name,
+                })
+            else:
+                writer.writerow({
+                    "lat": lat,
+                    "lon": lon,
+                    "country_code": "",
+                    "country": "",
+                })
+    print(f"💾 Geocode cache saved: {csv_filename}")
+
+
 def reverse_country(lon, lat, cache):
     """Reverse-geocode a point; return (country_code, country_name) or None."""
     key = (round(lat, 3), round(lon, 3))
@@ -511,6 +559,8 @@ if __name__ == "__main__":
                         help="Disable map output")
     parser.add_argument("--vignettes-csv", default="vignettes.csv",
                         help="CSV file with per-country vignette prices")
+    parser.add_argument("--geocode-cache", default="geocode_cache.csv",
+                        help="CSV file to cache Nominatim reverse-geocode results")
     args = parser.parse_args()
 
     city_start = args.start_city
@@ -580,7 +630,7 @@ if __name__ == "__main__":
     fmap = None if args.no_map else m
     known_tolls = toll_load("jumper_tolls.csv")
     vignettes = vignette_load(args.vignettes_csv)
-    geocode_cache = {}
+    geocode_cache = geocode_cache_load(args.geocode_cache)
     route_colors = ["blue", "orange", "purple", "red"]
 
     for i, r in enumerate(routes):
@@ -649,3 +699,4 @@ if __name__ == "__main__":
     print("✅ Map saved to climbing_crags_route.html")
 
     save_crags_to_gpx(crags, "crags.gpx")
+    geocode_cache_save(geocode_cache, args.geocode_cache)
