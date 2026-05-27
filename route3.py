@@ -51,6 +51,163 @@ def geocode(city_name):
         raise ValueError(f"City not found: {city_name}")
     return float(data[0]["lon"]), float(data[0]["lat"])
 
+
+def is_indoor_gym(tags):
+    return (
+        "building" in tags
+        or tags.get("leisure") in ("sports_centre", "playground", "pitch")
+        or tags.get("fee") == "yes"
+        or "opening_hours" in tags
+    )
+
+
+def website_from_tags(tags):
+    url = tags.get("website") or tags.get("contact:website")
+    if not url:
+        return None
+    url = url.strip()
+    if url and not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url
+
+
+def _sanitize_city_token(city_name):
+    token = city_name.split(",")[0].strip()
+    token = re.sub(r"[^A-Za-z0-9]+", "_", token)
+    return token.strip("_") or "city"
+
+
+def route_basename(start_city, end_city):
+    return f"{_sanitize_city_token(start_city)}_{_sanitize_city_token(end_city)}"
+
+
+def is_known_crag(tags):
+    for key, value in tags.items():
+        if not value or not str(value).strip():
+            continue
+        if key == "climbing:url" or key.startswith("climbing:url:"):
+            return True
+    if is_indoor_gym(tags):
+        return False
+    if tags.get("url") or tags.get("climbing:grade"):
+        return True
+    return bool(website_from_tags(tags))
+
+
+def filter_locations(in_buffer, variant):
+    if variant == "crags":
+        return [el for el in in_buffer
+                if not is_indoor_gym(el.get("tags", {}))]
+    if variant == "gym":
+        return in_buffer
+    if variant == "known":
+        return [el for el in in_buffer
+                if is_known_crag(el.get("tags", {}))]
+    raise ValueError(f"Unknown variant: {variant}")
+
+
+def create_base_map(center_lat, center_lon):
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=6, tiles=None)
+    folium.TileLayer(
+        tiles="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+        name="CartoDB Positron (Local File Compatible)",
+        attr='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
+    ).add_to(m)
+    folium.TileLayer(
+        tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        name="OpenStreetMap (Requires Web Server)",
+        attr='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+        referrerPolicy="no-referrer-when-downgrade"
+    ).add_to(m)
+    return m
+
+
+def add_route_layers(m, routes, route_buffer, search_buffer_km, route_colors,
+                     start_lat, start_lon, end_lat, end_lon,
+                     city_start, city_end):
+    for i, r in enumerate(routes):
+        route_coords = r["geometry"]["coordinates"]
+        route_ = [(lat, lon) for lon, lat in route_coords]
+        color = route_colors[i % len(route_colors)]
+        folium.PolyLine(route_, color=color, weight=3, opacity=0.8,
+                        tooltip=f"Route {i + 1}").add_to(m)
+
+    buffer_coords = list(route_buffer.exterior.coords)
+    folium.Polygon([(lat, lon) for lon, lat in buffer_coords],
+                   color="green", weight=1, fill=True, fill_opacity=0.1,
+                   tooltip=f"Search area ±{search_buffer_km} km").add_to(m)
+
+    folium.Marker([start_lat, start_lon], popup=f"Start: {city_start}",
+                  icon=folium.Icon(color="green")).add_to(m)
+    folium.Marker([end_lat, end_lon], popup=f"End: {city_end}",
+                  icon=folium.Icon(color="blue")).add_to(m)
+
+
+def add_toll_markers(fmap, nearby_tolls):
+    for t in nearby_tolls:
+        osm_link = f"https://www.openstreetmap.org/node/{t['id']}"
+        popup_html = f"""
+        <b>{t['name']}</b><br>
+        Fee: {t['fee']} {t['currency']}<br>
+        <a href="{osm_link}" target="_blank">OpenStreetMap</a>
+        """
+        folium.Marker(
+            [t["lat"], t["lon"]],
+            popup=popup_html,
+            tooltip=f"{t['name']} ({t['fee']} {t['currency']})",
+            icon=folium.Icon(color="blue", icon="road", prefix="fa")
+        ).add_to(fmap)
+
+
+def add_crag_markers(m, locations):
+    for el in locations:
+        tags = el.get("tags", {})
+        name = tags.get("int_name", tags.get("name:en", tags.get("name",
+                                                             "Unnamed crag")))
+        lat = el.get("lat") or el.get("center", {}).get("lat")
+        lon = el.get("lon") or el.get("center", {}).get("lon")
+
+        osm_url = f"https://www.openstreetmap.org/{el['type']}/{el['id']}"
+
+        if is_indoor_gym(tags):
+            website = website_from_tags(tags)
+            links = f'<a href="{osm_url}" target="_blank">OpenStreetMap</a>'
+            if website:
+                links += f' | <a href="{website}" target="_blank">Website</a>'
+            popup_html = f"""
+            <b>{name}</b><br>
+            📍 {lat:.4f}, {lon:.4f}<br>
+            {links}
+            """
+            icon = folium.Icon(color="orange", icon="home", prefix="fa")
+        else:
+            query_name = urllib.parse.quote(name)
+            thecrag_url = tags.get("climbing:url:thecrag",
+                        f"https://www.thecrag.com/search?S={query_name}#crags")
+            a8nu_url = f"https://www.8a.nu/search/crags?query={query_name}"
+            popup_html = f"""
+            <b>{name}</b><br>
+            📍 {lat:.4f}, {lon:.4f}<br>
+            <a href="{osm_url}" target="_blank">OpenStreetMap</a> |
+            <a href="{thecrag_url}" target="_blank">TheCrag</a> |
+            <a href="{a8nu_url}" target="_blank">8a.nu</a>
+            """
+            icon = folium.Icon(color="red", icon="flag")
+
+        folium.Marker(
+            [lat, lon],
+            popup=folium.Popup(popup_html, max_width=300),
+            icon=icon
+        ).add_to(m)
+
+
+def build_and_save_map(m, locations, path):
+    add_crag_markers(m, locations)
+    folium.LayerControl().add_to(m)
+    m.save(path)
+    print(f"Map saved: {path} ({len(locations)} locations)")
+
+
 def save_crags_to_gpx(crags, filename):
     gpx = ET.Element("gpx", version="1.1", creator="ClimbingRouteFinder",
                      xmlns="http://www.topografix.com/GPX/1/1")
@@ -62,7 +219,13 @@ def save_crags_to_gpx(crags, filename):
             continue
         wpt = ET.SubElement(gpx, "wpt", lat=str(lat), lon=str(lon))
         ET.SubElement(wpt, "name").text = name
-        ET.SubElement(wpt, "desc").text = f"https://www.openstreetmap.org/{el['type']}/{el['id']}"
+        tags = el.get("tags", {})
+        if is_indoor_gym(tags):
+            desc = website_from_tags(tags) or (
+                f"https://www.openstreetmap.org/{el['type']}/{el['id']}")
+        else:
+            desc = f"https://www.openstreetmap.org/{el['type']}/{el['id']}"
+        ET.SubElement(wpt, "desc").text = desc
     tree = ET.ElementTree(gpx)
     tree.write(filename, encoding="utf-8", xml_declaration=True)
     print(f"✅ GPX file saved: {filename}")
@@ -527,22 +690,10 @@ def calc_toll_cost(route, fmap=None, known_tolls=None, label=None):
     print(f"Total toll cost: {total_cost:.2f}" )
 
 
-    if fmap :
-        for t in nearby_tolls:
-            osm_link = f"https://www.openstreetmap.org/node/{t['id']}"
-            popup_html = f"""
-            <b>{t['name']}</b><br>
-            Fee: {t['fee']} {t['currency']}<br>
-            <a href="{osm_link}" target="_blank">OpenStreetMap</a>
-            """
-            folium.Marker(
-                [t["lat"], t["lon"]],
-                popup=popup_html,
-                tooltip=f"{t['name']} ({t['fee']} {t['currency']})",
-                icon=folium.Icon(color="blue", icon="road", prefix="fa")
-            ).add_to(fmap)
+    if fmap:
+        add_toll_markers(fmap, nearby_tolls)
 
-    return total_cost
+    return total_cost, nearby_tolls
 
 
 if __name__ == "__main__":
@@ -600,37 +751,21 @@ if __name__ == "__main__":
         return route_buffer.contains(Point(lon, lat))
 
 
-    crags = [el for el in elements if is_in_buffer(el)]
-    print(f"Found {len(crags)} climbing crags along the route.")
+    in_buffer = [el for el in elements if is_in_buffer(el)]
+    outdoor_crags = filter_locations(in_buffer, "crags")
+    all_with_gyms = filter_locations(in_buffer, "gym")
+    known_crags = filter_locations(in_buffer, "known")
+    gym_count = len(all_with_gyms) - len(outdoor_crags)
+    print(f"Found {len(in_buffer)} in buffer: {len(outdoor_crags)} outdoor, "
+          f"{gym_count} gyms; known={len(known_crags)}")
 
-
-    # === STEP 6: Create map ===
-    center_lat = (start_lat + end_lat) / 2
-    center_lon = (start_lon + end_lon) / 2
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=6,
-                   tiles=None)
-    
-    # CartoDB Positron: Beautiful, fast, and fully compatible with local file (file://) protocol viewing
-    folium.TileLayer(
-        tiles="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-        name="CartoDB Positron (Local File Compatible)",
-        attr='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
-    ).add_to(m)
-    
-    # Standard OpenStreetMap: Requires a local web server (e.g. python -m http.server) to satisfy Referer checks
-    folium.TileLayer(
-        tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-        name="OpenStreetMap (Requires Web Server)",
-        attr='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-        referrerPolicy="no-referrer-when-downgrade"
-    ).add_to(m)
-
-    fmap = None if args.no_map else m
+    base = route_basename(city_start, city_end)
     known_tolls = toll_load("jumper_tolls.csv")
     vignettes = vignette_load(args.vignettes_csv)
     geocode_cache = geocode_cache_load(args.geocode_cache)
     route_colors = ["blue", "orange", "purple", "red"]
 
+    primary_tolls = None
     for i, r in enumerate(routes):
         route_coords = r["geometry"]["coordinates"]
         label = i + 1
@@ -639,62 +774,32 @@ if __name__ == "__main__":
         print(f"\n=== Route {label} ===")
         print(f"distance: {dist_km:.1f} km, duration: {dur_h:.2f} h")
 
-        route_fmap = fmap if i == 0 else None
-        toll_total = calc_toll_cost(route_coords, route_fmap, known_tolls, label)
+        toll_total, route_tolls = calc_toll_cost(
+            route_coords, fmap=None, known_tolls=known_tolls, label=label)
+        if i == 0:
+            primary_tolls = route_tolls
         vignette_total = calc_vignette_cost(
             route_coords, vignettes=vignettes,
             geocode_cache=geocode_cache, label=label)
         print(f"Total travel cost (tolls + vignettes): "
               f"{toll_total + vignette_total:.2f} EUR")
 
-        route_ = [(lat, lon) for lon, lat in route_coords]
-        color = route_colors[i % len(route_colors)]
-        folium.PolyLine(route_, color=color, weight=3, opacity=0.8,
-                        tooltip=f"Route {label}").add_to(m)
+    if not args.no_map:
+        center_lat = (start_lat + end_lat) / 2
+        center_lon = (start_lon + end_lon) / 2
+        variants = [
+            ("crags", outdoor_crags),
+            ("crags_gym", all_with_gyms),
+            ("crags_known", known_crags),
+        ]
+        for idx, (suffix, locations) in enumerate(variants):
+            m = create_base_map(center_lat, center_lon)
+            add_route_layers(
+                m, routes, route_buffer, search_buffer_km, route_colors,
+                start_lat, start_lon, end_lat, end_lon, city_start, city_end)
+            if idx == 0 and primary_tolls:
+                add_toll_markers(m, primary_tolls)
+            build_and_save_map(m, locations, f"{base}_{suffix}.html")
 
-    # Buffer polygon (approximate)
-    buffer_coords = list(route_buffer.exterior.coords)
-    folium.Polygon([(lat, lon) for lon, lat in buffer_coords],
-               color="green", weight=1, fill=True, fill_opacity=0.1,
-               tooltip=f"Search area ±{search_buffer_km} km").add_to(m)
-
-    # === STEP 7: Add markers for crags ===
-    for el in crags:
-        tags = el.get("tags", {})
-        name = tags.get("int_name", tags.get("name:en", tags.get("name",
-                                                             "Unnamed crag")))
-        lat = el.get("lat") or el.get("center", {}).get("lat")
-        lon = el.get("lon") or el.get("center", {}).get("lon")
-
-        osm_url = f"https://www.openstreetmap.org/{el['type']}/{el['id']}"
-        query_name = urllib.parse.quote(name)
-        thecrag_url = tags.get("climbing:url:thecrag",
-                    f"https://www.thecrag.com/search?S={query_name}#crags")
-        a8nu_url = f"https://www.8a.nu/search/crags?query={query_name}"
-
-        popup_html = f"""
-        <b>{name}</b><br>
-        📍 {lat:.4f}, {lon:.4f}<br>
-        <a href="{osm_url}" target="_blank">OpenStreetMap</a> |
-        <a href="{thecrag_url}" target="_blank">TheCrag</a> |
-        <a href="{a8nu_url}" target="_blank">8a.nu</a>
-        """
-        folium.Marker(
-            [lat, lon],
-            popup=folium.Popup(popup_html, max_width=300),
-            icon=folium.Icon(color="red", icon="flag")
-        ).add_to(m)
-
-    # Start & end markers
-    folium.Marker([start_lat, start_lon], popup=f"Start: {city_start}",
-                  icon=folium.Icon(color="green")).add_to(m)
-    folium.Marker([end_lat, end_lon], popup=f"End: {city_end}",
-                  icon=folium.Icon(color="blue")).add_to(m)
-
-    # === STEP 8: Save map ===
-    folium.LayerControl().add_to(m)
-    m.save("climbing_crags_route.html")
-    print("✅ Map saved to climbing_crags_route.html")
-
-    save_crags_to_gpx(crags, "crags.gpx")
+    save_crags_to_gpx(outdoor_crags, f"{base}_crags.gpx")
     geocode_cache_save(geocode_cache, args.geocode_cache)
