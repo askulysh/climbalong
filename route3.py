@@ -616,6 +616,30 @@ def calc_vignette_cost(route_coords, csv_path="vignettes.csv", vignettes=None,
     return total
 
 
+def calc_fuel_cost(distance_km, consumption_l_per_100km=consumption,
+                   price_per_liter=fuel_cost, label=None):
+    liters = (distance_km / 100) * consumption_l_per_100km
+    total = liters * price_per_liter
+    if label is not None:
+        print(f"\n--- Route {label}: fuel ---")
+    print(f"Distance: {distance_km:.1f} km, "
+          f"consumption: {consumption_l_per_100km} L/100km @ "
+          f"{price_per_liter:.2f} EUR/L")
+    print(f"Fuel used: {liters:.1f} L")
+    print(f"Fuel cost: {total:.2f} EUR")
+    return total
+
+
+def print_route_cost_summary(route_costs):
+    print("\n=== Route cost summary ===")
+    for r in route_costs:
+        print(f"\nRoute {r['label']}: {r['dist_km']:.1f} km, {r['dur_h']:.2f} h")
+        print(f"  Tolls:     {r['tolls']:8.2f} EUR")
+        print(f"  Vignettes: {r['vignettes']:8.2f} EUR")
+        print(f"  Fuel:      {r['fuel']:8.2f} EUR ({r['fuel_liters']:.1f} L)")
+        print(f"  Total:     {r['total']:8.2f} EUR")
+
+
 def calc_toll_cost(route, fmap=None, known_tolls=None, label=None):
     elements = _fetch_toll_elements(route)
 
@@ -766,6 +790,7 @@ if __name__ == "__main__":
     route_colors = ["blue", "orange", "purple", "red"]
 
     primary_tolls = None
+    route_costs = []
     for i, r in enumerate(routes):
         route_coords = r["geometry"]["coordinates"]
         label = i + 1
@@ -781,8 +806,23 @@ if __name__ == "__main__":
         vignette_total = calc_vignette_cost(
             route_coords, vignettes=vignettes,
             geocode_cache=geocode_cache, label=label)
-        print(f"Total travel cost (tolls + vignettes): "
-              f"{toll_total + vignette_total:.2f} EUR")
+        fuel_total = calc_fuel_cost(dist_km, label=label)
+        fuel_liters = (dist_km / 100) * consumption
+        total_cost = toll_total + vignette_total + fuel_total
+        route_costs.append({
+            "label": label,
+            "dist_km": dist_km,
+            "dur_h": dur_h,
+            "tolls": toll_total,
+            "vignettes": vignette_total,
+            "fuel": fuel_total,
+            "fuel_liters": fuel_liters,
+            "total": total_cost,
+        })
+        print(f"Total travel cost (tolls + vignettes + fuel): "
+              f"{total_cost:.2f} EUR")
+
+    print_route_cost_summary(route_costs)
 
     if not args.no_map:
         center_lat = (start_lat + end_lat) / 2
