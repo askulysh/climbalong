@@ -42,7 +42,7 @@ A8_BASE = "https://www.8a.nu"
 A8_MATCH_RADIUS_KM = 10
 TOILET_SEARCH_RADIUS_KM = 10
 A8_LINK_RE = re.compile(
-    r'<a href="(/crags/sportclimbing/[^"]+/routes)"[^>]*>([^<]+)</a>',
+    r'<a href="(/crags/sportclimbing/[^"]+/routes(?:\?[^"]*)?)"[^>]*>([^<]+)</a>',
     re.I)
 A8_PAYLOAD_RE = re.compile(
     r'"([^"]+)","([a-z0-9][a-z0-9-]*)","([^"]+)","([a-z0-9][a-z0-9-]*)",'
@@ -223,6 +223,16 @@ def _norm_crag_name(name):
     return re.sub(r"\s+", " ", s).strip().casefold()
 
 
+def _a8_search_name(name):
+    """Strip OSM 'sector ' prefix before 8a.nu search/match."""
+    if not name:
+        return name
+    s = name.strip()
+    if re.match(r"^sector\s+", s, re.I):
+        return re.sub(r"^sector\s+", "", s, count=1, flags=re.I).strip()
+    return s
+
+
 def _slugify(name):
     s = unicodedata.normalize("NFKD", name)
     s = "".join(c for c in s if not unicodedata.combining(c))
@@ -346,14 +356,19 @@ def _parse_8a_routes_grades(html):
 
 def fetch_8a_route_stats(direct_url):
     base = direct_url.rstrip("/")
-    if base.endswith("/routes"):
+    path = base.split("?", 1)[0]
+    if path.endswith("/routes"):
         routes_url = base
     else:
         routes_url = base + "/routes"
     all_grades = []
     page = 1
     while True:
-        url = routes_url if page == 1 else f"{routes_url}?page={page}"
+        if page == 1:
+            url = routes_url
+        else:
+            sep = "&" if "?" in routes_url else "?"
+            url = f"{routes_url}{sep}page={page}"
         try:
             resp = requests.get(url, headers=OVERPASS_HEADERS, timeout=30)
             resp.raise_for_status()
@@ -449,7 +464,7 @@ def _format_a8_stats_lines(entry):
 
 
 def _a8_search_url(name):
-    return f"{A8_BASE}/search/crags?query={urllib.parse.quote(name)}"
+    return f"{A8_BASE}/search/crags?query={urllib.parse.quote(_a8_search_name(name))}"
 
 
 def _is_thecrag_direct(url):
@@ -579,23 +594,51 @@ def _parse_8a_search_entries(html):
         if len(parts) < 4:
             continue
         country, slug = parts[2], parts[3]
-        key = ("crag", link_name, country, slug)
+        sector_slug = None
+        if "?sector=" in path:
+            kind = "sector"
+            sector_slug = path.split("?sector=", 1)[1].split("&", 1)[0]
+            key = ("sector", link_name, country, slug, sector_slug)
+        else:
+            kind = "crag"
+            key = ("crag", link_name, country, slug)
         if key in seen:
             continue
         seen.add(key)
         lat, lon = coord_by_slug.get((country, slug), (None, None))
-        entries.append({
-            "kind": "crag",
+        entry = {
+            "kind": kind,
             "name": link_name,
             "country": country,
             "slug": slug,
             "lat": lat,
             "lon": lon,
-        })
+            "url_path": path,
+        }
+        if sector_slug:
+            entry["sector_slug"] = sector_slug
+        entries.append(entry)
     return entries
 
 
+def _dedupe_8a_entries(entries):
+    seen = set()
+    deduped = []
+    for entry in entries:
+        key = entry.get("url_path") or (
+            entry["kind"], entry["country"], entry["slug"],
+            entry.get("sector_slug"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(entry)
+    return deduped
+
+
 def _a8_entry_url(entry):
+    url_path = entry.get("url_path")
+    if url_path:
+        return A8_BASE + url_path
     return _a8_direct_url(entry["country"], entry["slug"])
 
 
@@ -603,35 +646,71 @@ def _match_8a_url(name, entries, country_slug=None, lat=None, lon=None):
     target = _norm_crag_name(name)
     name_slug = _slugify(name)
 
-    if lat is not None and lon is not None:
-        entries = [e for e in entries if _entry_within_radius(e, lat, lon)]
-        if not entries:
-            return None
-
-    def exact_matches():
-        for kind in ("crag", "area"):
-            for entry in entries:
-                if entry["kind"] != kind:
-                    continue
-                if _norm_crag_name(entry["name"]) == target:
-                    yield entry
-
-    matches = list(exact_matches())
+    exact_named = [e for e in entries if _norm_crag_name(e["name"]) == target]
     if country_slug:
-        in_country = [e for e in matches if e["country"] == country_slug]
-        if in_country:
-            return _a8_entry_url(in_country[0])
-        for kind in ("crag", "area"):
-            for entry in entries:
-                if entry["kind"] != kind or entry["country"] != country_slug:
+        exact_named = [e for e in exact_named if e["country"] == country_slug]
+
+    if exact_named:
+        for kind in ("sector", "crag", "area"):
+            for entry in exact_named:
+                if entry["kind"] == kind:
+                    return _a8_entry_url(entry)
+
+    if lat is not None and lon is not None:
+        with_coords = [
+            e for e in entries
+            if e.get("lat") is not None and _entry_within_radius(e, lat, lon)]
+        if with_coords:
+            pool = with_coords
+        else:
+            pool = [e for e in entries if e.get("lat") is None]
+            if not pool:
+                return None
+    else:
+        pool = entries
+
+    if country_slug:
+        pool = [e for e in pool if e["country"] == country_slug]
+        if not pool:
+            return None
+        for kind in ("sector", "crag", "area"):
+            for entry in pool:
+                if entry["kind"] != kind:
                     continue
                 slug = entry["slug"]
                 if slug == name_slug or slug.endswith("-" + name_slug):
                     return _a8_entry_url(entry)
+                sector_slug = entry.get("sector_slug")
+                if sector_slug and (
+                        sector_slug == name_slug
+                        or sector_slug.endswith("-" + name_slug)):
+                    return _a8_entry_url(entry)
         return None
-    if matches:
-        return _a8_entry_url(matches[0])
+
+    for kind in ("sector", "crag", "area"):
+        for entry in pool:
+            if entry["kind"] == kind and _norm_crag_name(entry["name"]) == target:
+                return _a8_entry_url(entry)
     return None
+
+
+def _fetch_8a_search_matches(name, country_slug=None, lat=None, lon=None):
+    search_name = _a8_search_name(name)
+    entries = []
+    for endpoint in ("crags", "sectors"):
+        try:
+            resp = requests.get(
+                f"{A8_BASE}/search/{endpoint}",
+                params={"query": search_name},
+                headers=OVERPASS_HEADERS,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            entries.extend(_parse_8a_search_entries(resp.text))
+        except requests.RequestException:
+            continue
+    return _match_8a_url(
+        search_name, _dedupe_8a_entries(entries), country_slug, lat, lon)
 
 
 def resolve_8a_nu_url(name, cache, country_slug=None, lat=None, lon=None):
@@ -656,21 +735,10 @@ def resolve_8a_nu_url(name, cache, country_slug=None, lat=None, lon=None):
     search_url = _a8_search_url(name)
     url = search_url
     stats = {}
-    try:
-        resp = requests.get(
-            f"{A8_BASE}/search/crags",
-            params={"query": name},
-            headers=OVERPASS_HEADERS,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        matched = _match_8a_url(
-            name, _parse_8a_search_entries(resp.text),
-            country_slug=country_slug, lat=lat, lon=lon)
-        if matched:
-            url = matched
-    except requests.RequestException:
-        pass
+    matched = _fetch_8a_search_matches(
+        name, country_slug=country_slug, lat=lat, lon=lon)
+    if matched:
+        url = matched
     if _is_a8_direct(url):
         fetched = fetch_8a_route_stats(url)
         if fetched:
