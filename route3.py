@@ -461,12 +461,12 @@ def _is_a8_direct(url):
 
 
 def _a8_highlight_bands(entry):
-    """True when 8a stats show >3 routes in both 6a–6b+ and 7a–7b+ bands."""
+    """True when 8a stats show >=3 routes in both 6a–6b+ and 7a–7b+ bands."""
     if not entry:
         return False
     b1 = entry.get("routes_6a_6b")
     b2 = entry.get("routes_7a_7b")
-    return b1 is not None and b1 > 3 and b2 is not None and b2 > 3
+    return b1 is not None and b1 >= 3 and b2 is not None and b2 >= 3
 
 
 def _crag_icon_color(name, thecrag_url, a8nu_url, a8_entry=None):
@@ -744,7 +744,7 @@ def add_crag_legend(m):
                 border-radius: 4px; font-size: 13px; line-height: 1.5;">
       <b>Crags</b><br>
       <span style="color:#2ecc71;">&#9679;</span> direct TheCrag / 8a.nu link<br>
-      <span style="color:#f1c40f;">&#9679;</span> 6a–6b+ &amp; 7a–7b+ &gt;3 routes each<br>
+      <span style="color:#f1c40f;">&#9679;</span> 6a–6b+ &amp; 7a–7b+ &ge;3 routes each<br>
       <span style="color:#e74c3c;">&#9679;</span> named (search links only)<br>
       <span style="color:#7f8c8d;">&#9679;</span> unnamed<br>
       <span style="color:#e67e22;">&#9679;</span> indoor gym<br>
