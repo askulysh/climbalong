@@ -1658,9 +1658,6 @@ if __name__ == "__main__":
                         continue
                     country_slug = _crag_country_slug(
                         tags, lon, lat, geocode_cache)
-                    if cached and _a8_entry_needs_stats(cached):
-                        to_resolve.add((name, country_slug, lat, lon))
-                        continue
                     key = _a8_cache_key(name, country_slug, lat, lon)
                     if key not in a8_cache:
                         to_resolve.add((name, country_slug, lat, lon))
