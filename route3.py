@@ -12,6 +12,8 @@ import csv
 import os
 import argparse
 import time
+import unicodedata
+import math
 
 # === CONFIGURATION ===
 #city_start = "Chernivtsi, Ukraine"
@@ -36,6 +38,57 @@ OVERPASS_URLS = [
     "https://overpass.kumi.systems/api/interpreter",
 ]
 OVERPASS_HEADERS = {"User-Agent": "route-climbing-fetcher"}
+A8_BASE = "https://www.8a.nu"
+A8_MATCH_RADIUS_KM = 10
+A8_LINK_RE = re.compile(
+    r'<a href="(/crags/sportclimbing/[^"]+/routes)"[^>]*>([^<]+)</a>',
+    re.I)
+A8_PAYLOAD_RE = re.compile(
+    r'"([^"]+)","([a-z0-9][a-z0-9-]*)","([^"]+)","([a-z0-9][a-z0-9-]*)",'
+    r'(?:(?!"\{)[\s\S]){0,600}?\{"latitude":\d+,"longitude":\d+\},([\d.]+),([\d.]+)')
+A8_ROUTE_ROW_RE = re.compile(r'<tr[^>]*data-v[^>]*>(.*?)</tr>', re.S)
+A8_GRADE_RE = re.compile(r'^[56789][abc]?\+?$')
+FRENCH_GRADES = [
+    "5", "5a", "5a+", "5b", "5b+", "5c", "5c+",
+    "6a", "6a+", "6b", "6b+", "6c", "6c+",
+    "7a", "7a+", "7b", "7b+", "7c", "7c+",
+    "8a", "8a+", "8b", "8b+", "8c", "8c+",
+    "9a", "9a+", "9b", "9b+",
+]
+OSM_GRADE_SYSTEMS = ("french", "uiaa", "saxon", "norwegian", "yds_class")
+A8_CACHE_FIELDS = [
+    "name", "country", "lat", "lon", "url",
+    "routes_total", "grade_min", "grade_max",
+    "routes_6a_6b", "routes_7a_7b", "routes_7c_8a",
+]
+A8_COUNTRY_SLUG = {
+    "DE": "germany",
+    "AT": "austria",
+    "IT": "italy",
+    "FR": "france",
+    "ES": "spain",
+    "GR": "greece",
+    "CH": "switzerland",
+    "PL": "poland",
+    "CZ": "czechia",
+    "SK": "slovakia",
+    "SI": "slovenia",
+    "HR": "croatia",
+    "HU": "hungary",
+    "RO": "romania",
+    "BG": "bulgaria",
+    "UA": "ukraine",
+    "GB": "united-kingdom",
+    "US": "united-states",
+    "NO": "norway",
+    "SE": "sweden",
+    "FI": "finland",
+    "PT": "portugal",
+    "BE": "belgium",
+    "NL": "netherlands",
+    "LU": "luxembourg",
+    "TR": "turkey",
+}
 
 #routes = 3
 
@@ -159,11 +212,550 @@ def add_toll_markers(fmap, nearby_tolls):
         ).add_to(fmap)
 
 
-def add_crag_markers(m, locations):
+def _crag_name_from_tags(tags):
+    return tags.get("int_name", tags.get("name:en", tags.get("name")))
+
+
+def _norm_crag_name(name):
+    s = unicodedata.normalize("NFKD", name)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", s).strip().casefold()
+
+
+def _slugify(name):
+    s = unicodedata.normalize("NFKD", name)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = s.casefold()
+    return re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+
+
+def _a8_cache_key(name, country_slug=None, lat=None, lon=None):
+    lat_k = round(lat, GEOCODE_CACHE_DECIMALS) if lat is not None else ""
+    lon_k = round(lon, GEOCODE_CACHE_DECIMALS) if lon is not None else ""
+    return (_norm_crag_name(name), country_slug or "", lat_k, lon_k)
+
+
+def _a8_cache_key_parts(key):
+    """Unpack cache key as (name, country, lat_k, lon_k); legacy keys are 2-tuples."""
+    if len(key) == 2:
+        name, country = key
+        return name, country, "", ""
+    name, country, lat_k, lon_k = key
+    return name, country, lat_k, lon_k
+
+
+def _a8_normalize_entry(val):
+    if isinstance(val, dict):
+        return val
+    return {"url": val}
+
+
+def _a8_lookup_entry(name, cache, country_slug=None, lat=None, lon=None):
+    """Return cached 8a entry dict if unambiguous; else None."""
+    norm = _norm_crag_name(name)
+    key = _a8_cache_key(name, country_slug, lat, lon)
+    if key in cache:
+        return _a8_normalize_entry(cache[key])
+    if country_slug is not None or (lat is not None and lon is not None):
+        key2 = (norm, country_slug or "", "", "")
+        if key2 in cache:
+            return _a8_normalize_entry(cache[key2])
+    by_name = [
+        _a8_normalize_entry(v) for k, v in cache.items()
+        if _a8_cache_key_parts(k)[0] == norm]
+    if len(by_name) == 1:
+        return by_name[0]
+    return None
+
+
+def _a8_find_cache_key(name, cache, country_slug=None, lat=None, lon=None):
+    norm = _norm_crag_name(name)
+    key = _a8_cache_key(name, country_slug, lat, lon)
+    if key in cache:
+        return key
+    key2 = (norm, country_slug or "", "", "")
+    if key2 in cache:
+        return key2
+    matches = [k for k in cache if _a8_cache_key_parts(k)[0] == norm]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+def _a8_lookup_cached(name, cache, country_slug=None, lat=None, lon=None):
+    entry = _a8_lookup_entry(name, cache, country_slug, lat, lon)
+    return entry["url"] if entry else None
+
+
+def _haversine_km(lat1, lon1, lat2, lon2):
+    r = 6371.0
+    p = math.pi / 180
+    dlat = (lat2 - lat1) * p
+    dlon = (lon2 - lon1) * p
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(lat1 * p) * math.cos(lat2 * p) * math.sin(dlon / 2) ** 2)
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def _entry_within_radius(entry, lat, lon, radius_km=A8_MATCH_RADIUS_KM):
+    elat = entry.get("lat")
+    elon = entry.get("lon")
+    if elat is None or elon is None:
+        return False
+    return _haversine_km(lat, lon, elat, elon) <= radius_km
+
+
+def _french_grade_index(grade):
+    g = grade.strip().lower()
+    try:
+        return FRENCH_GRADES.index(g)
+    except ValueError:
+        return None
+
+
+def _grade_in_range(grade, low, high):
+    i = _french_grade_index(grade)
+    if i is None:
+        return False
+    return _french_grade_index(low) <= i <= _french_grade_index(high)
+
+
+def _summarize_route_grades(grades):
+    valid = [g for g in grades if _french_grade_index(g) is not None]
+    if not valid:
+        return None
+    indices = [_french_grade_index(g) for g in valid]
+    return {
+        "routes_total": len(valid),
+        "grade_min": FRENCH_GRADES[min(indices)],
+        "grade_max": FRENCH_GRADES[max(indices)],
+        "routes_6a_6b": sum(1 for g in valid if _grade_in_range(g, "6a", "6b+")),
+        "routes_7a_7b": sum(1 for g in valid if _grade_in_range(g, "7a", "7b+")),
+        "routes_7c_8a": sum(1 for g in valid if _grade_in_range(g, "7c", "8a")),
+    }
+
+
+def _parse_8a_routes_grades(html):
+    grades = []
+    for row in A8_ROUTE_ROW_RE.findall(html):
+        cells = re.findall(r'>([^<]{1,20})<', row)
+        if cells and A8_GRADE_RE.match(cells[0]):
+            grades.append(cells[0])
+    return grades
+
+
+def fetch_8a_route_stats(direct_url):
+    base = direct_url.rstrip("/")
+    if base.endswith("/routes"):
+        routes_url = base
+    else:
+        routes_url = base + "/routes"
+    all_grades = []
+    page = 1
+    while True:
+        url = routes_url if page == 1 else f"{routes_url}?page={page}"
+        try:
+            resp = requests.get(url, headers=OVERPASS_HEADERS, timeout=30)
+            resp.raise_for_status()
+        except requests.RequestException:
+            break
+        grades = _parse_8a_routes_grades(resp.text)
+        if not grades:
+            break
+        all_grades.extend(grades)
+        page += 1
+        time.sleep(0.3)
+    return _summarize_route_grades(all_grades)
+
+
+def _osm_crag_stats(tags):
+    routes_total = None
+    raw = tags.get("climbing:routes", "").strip()
+    if raw.isdigit():
+        routes_total = int(raw)
+    grade_min = grade_max = grade_system = None
+    for system in OSM_GRADE_SYSTEMS:
+        lo = tags.get(f"climbing:grade:{system}:min", "").strip()
+        hi = tags.get(f"climbing:grade:{system}:max", "").strip()
+        if lo and hi:
+            grade_min, grade_max, grade_system = lo, hi, system
+            break
+    if not grade_min:
+        mins, maxs = {}, {}
+        for key, val in tags.items():
+            m = re.match(r"climbing:grade:([^:]+):min$", key)
+            if m and val.strip():
+                mins[m.group(1)] = val.strip()
+            m = re.match(r"climbing:grade:([^:]+):max$", key)
+            if m and val.strip():
+                maxs[m.group(1)] = val.strip()
+        for system in sorted(set(mins) & set(maxs)):
+            grade_min = mins[system]
+            grade_max = maxs[system]
+            grade_system = system
+            break
+    if routes_total is None and grade_min is None:
+        return None
+    return {
+        "routes_total": routes_total,
+        "grade_min": grade_min,
+        "grade_max": grade_max,
+        "grade_system": grade_system,
+    }
+
+
+def _format_osm_stats_line(stats):
+    if not stats:
+        return None
+    parts = []
+    if stats.get("routes_total") is not None:
+        parts.append(f"{stats['routes_total']} routes")
+    if stats.get("grade_min") and stats.get("grade_max"):
+        g = f"{stats['grade_min']}–{stats['grade_max']}"
+        if stats.get("grade_system") and stats["grade_system"] != "french":
+            g += f", {stats['grade_system']}"
+        parts.append(f"({g})")
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return f"OSM: {parts[0]}"
+    return f"OSM: {parts[0]} {parts[1]}"
+
+
+def _format_a8_stats_lines(entry):
+    if not entry or not _is_a8_direct(entry.get("url", "")):
+        return []
+    lines = []
+    rt = entry.get("routes_total")
+    gmin = entry.get("grade_min")
+    gmax = entry.get("grade_max")
+    if rt is not None and gmin and gmax:
+        lines.append(f"8a.nu: {rt} routes ({gmin}–{gmax})")
+    elif rt is not None:
+        lines.append(f"8a.nu: {rt} routes")
+    b1 = entry.get("routes_6a_6b")
+    b2 = entry.get("routes_7a_7b")
+    b3 = entry.get("routes_7c_8a")
+    bands = []
+    if b1:
+        bands.append(f"6a–6b+: {b1}")
+    if b2:
+        bands.append(f"7a–7b+: {b2}")
+    if b3:
+        bands.append(f"7c–8a: {b3}")
+    if bands:
+        lines.append(" | ".join(bands))
+    return lines
+
+
+def _a8_search_url(name):
+    return f"{A8_BASE}/search/crags?query={urllib.parse.quote(name)}"
+
+
+def _is_thecrag_direct(url):
+    return bool(url and "thecrag.com" in url and "/search" not in url)
+
+
+def _is_a8_direct(url):
+    return bool(url and "8a.nu" in url and "/crags/sportclimbing/" in url)
+
+
+def _a8_highlight_bands(entry):
+    """True when 8a stats show >3 routes in both 6a–6b+ and 7a–7b+ bands."""
+    if not entry:
+        return False
+    b1 = entry.get("routes_6a_6b")
+    b2 = entry.get("routes_7a_7b")
+    return b1 is not None and b1 > 3 and b2 is not None and b2 > 3
+
+
+def _crag_icon_color(name, thecrag_url, a8nu_url, a8_entry=None):
+    if not name:
+        return "gray"
+    if _a8_highlight_bands(a8_entry):
+        return "beige"
+    if _is_thecrag_direct(thecrag_url) or _is_a8_direct(a8nu_url):
+        return "green"
+    return "red"
+
+
+def _crag_marker_icon(name, thecrag_url, a8nu_url, a8_entry=None):
+    color = _crag_icon_color(name, thecrag_url, a8nu_url, a8_entry)
+  
+    return folium.Icon(color=color, icon="flag")
+
+
+def thecrag_url_from_tags(tags):
+    url = tags.get("climbing:url:thecrag")
+    if url:
+        return url.strip()
+    crag_url = tags.get("climbing:url")
+    if crag_url and "thecrag.com" in crag_url:
+        return crag_url.strip()
+    return None
+
+
+def _outdoor_crag_urls(name, tags, a8_cache, lon=None, lat=None,
+                      geocode_cache=None):
+    """Return (thecrag_url, a8nu_url, a8_entry) for popup links."""
+    thecrag_url = thecrag_url_from_tags(tags)
+    if name and not thecrag_url:
+        query_name = urllib.parse.quote(name)
+        thecrag_url = f"https://www.thecrag.com/search?S={query_name}#crags"
+    a8nu_url = None
+    a8_entry = None
+    if name:
+        if a8_cache is not None:
+            a8_entry = _a8_lookup_entry(name, a8_cache, lat=lat, lon=lon)
+            country_slug = None
+            if a8_entry is None:
+                country_slug = _crag_country_slug(
+                    tags, lon, lat, geocode_cache)
+                a8_entry = _a8_lookup_entry(
+                    name, a8_cache, country_slug, lat, lon)
+            if a8_entry is None:
+                if country_slug is None:
+                    country_slug = _crag_country_slug(
+                        tags, lon, lat, geocode_cache)
+                a8_entry = resolve_8a_nu_url(
+                    name, a8_cache, country_slug=country_slug,
+                    lat=lat, lon=lon)
+            a8nu_url = a8_entry["url"]
+        else:
+            a8nu_url = _a8_search_url(name)
+    return thecrag_url, a8nu_url, a8_entry
+
+
+def _a8_direct_url(country, slug):
+    return f"{A8_BASE}/crags/sportclimbing/{country}/{slug}"
+
+
+def _country_from_payload_window(window):
+    matches = re.findall(r'"([a-z0-9-]+)","([^"]+)"', window)
+    for slug, label in reversed(matches):
+        if slug in ("yes", "no", "limited", "null"):
+            continue
+        if re.match(r"^[A-Z][a-zA-Z /'-]+$", label) and slug != label.lower().replace(" ", "-"):
+            return slug
+        if label in ("Italy", "France", "Germany", "Greece", "Austria", "Switzerland",
+                     "Spain", "Poland", "United Kingdom", "United States", "Brazil",
+                     "Unknown", "Netherlands", "Belgium", "Norway", "Sweden", "Finland",
+                     "Portugal", "Czechia", "Slovakia", "Slovenia", "Croatia", "Hungary",
+                     "Romania", "Bulgaria", "Ukraine", "Turkey", "Luxembourg"):
+            return slug
+    return None
+
+
+def _parse_8a_search_entries(html):
+    entries = []
+    seen = set()
+    coord_by_slug = {}
+    for m in A8_PAYLOAD_RE.finditer(html):
+        area, area_slug, crag, crag_slug, lat_s, lon_s = m.groups()
+        lat, lon = float(lat_s), float(lon_s)
+        country = _country_from_payload_window(m.group(0))
+        if not country:
+            continue
+        coord_by_slug[(country, area_slug)] = (lat, lon)
+        coord_by_slug[(country, crag_slug)] = (lat, lon)
+        for kind, display, slug in (
+            ("area", area, area_slug),
+            ("crag", crag, crag_slug),
+        ):
+            key = (kind, display, country, slug)
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append({
+                "kind": kind,
+                "name": display,
+                "country": country,
+                "slug": slug,
+                "lat": lat,
+                "lon": lon,
+            })
+    for path, link_name in A8_LINK_RE.findall(html):
+        parts = path.strip("/").split("/")
+        if len(parts) < 4:
+            continue
+        country, slug = parts[2], parts[3]
+        key = ("crag", link_name, country, slug)
+        if key in seen:
+            continue
+        seen.add(key)
+        lat, lon = coord_by_slug.get((country, slug), (None, None))
+        entries.append({
+            "kind": "crag",
+            "name": link_name,
+            "country": country,
+            "slug": slug,
+            "lat": lat,
+            "lon": lon,
+        })
+    return entries
+
+
+def _a8_entry_url(entry):
+    return _a8_direct_url(entry["country"], entry["slug"])
+
+
+def _match_8a_url(name, entries, country_slug=None, lat=None, lon=None):
+    target = _norm_crag_name(name)
+    name_slug = _slugify(name)
+
+    if lat is not None and lon is not None:
+        entries = [e for e in entries if _entry_within_radius(e, lat, lon)]
+        if not entries:
+            return None
+
+    def exact_matches():
+        for kind in ("crag", "area"):
+            for entry in entries:
+                if entry["kind"] != kind:
+                    continue
+                if _norm_crag_name(entry["name"]) == target:
+                    yield entry
+
+    matches = list(exact_matches())
+    if country_slug:
+        in_country = [e for e in matches if e["country"] == country_slug]
+        if in_country:
+            return _a8_entry_url(in_country[0])
+        for kind in ("crag", "area"):
+            for entry in entries:
+                if entry["kind"] != kind or entry["country"] != country_slug:
+                    continue
+                slug = entry["slug"]
+                if slug == name_slug or slug.endswith("-" + name_slug):
+                    return _a8_entry_url(entry)
+        return None
+    if matches:
+        return _a8_entry_url(matches[0])
+    return None
+
+
+def resolve_8a_nu_url(name, cache, country_slug=None, lat=None, lon=None):
+    """Resolve 8a.nu URL via search page; return cache entry dict."""
+    cached = _a8_lookup_entry(name, cache, country_slug, lat, lon)
+    if cached is not None :
+        return cached
+    key = _a8_find_cache_key(name, cache, country_slug, lat, lon)
+    if key is None:
+        key = _a8_cache_key(name, country_slug, lat, lon)
+    if cached is not None:
+        url = cached["url"]
+        stats = {}
+        if _is_a8_direct(url):
+            fetched = fetch_8a_route_stats(url)
+            if fetched:
+                stats = fetched
+        entry = {**cached, **stats}
+        cache[key] = entry
+        time.sleep(0.3)
+        return entry
+    search_url = _a8_search_url(name)
+    url = search_url
+    stats = {}
+    try:
+        resp = requests.get(
+            f"{A8_BASE}/search/crags",
+            params={"query": name},
+            headers=OVERPASS_HEADERS,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        matched = _match_8a_url(
+            name, _parse_8a_search_entries(resp.text),
+            country_slug=country_slug, lat=lat, lon=lon)
+        if matched:
+            url = matched
+    except requests.RequestException:
+        pass
+    if _is_a8_direct(url):
+        fetched = fetch_8a_route_stats(url)
+        if fetched:
+            stats = fetched
+    entry = {"url": url, **stats}
+    cache[key] = entry
+    time.sleep(0.3)
+    return entry
+
+
+def a8_cache_load(csv_filename):
+    cache = {}
+    if not os.path.exists(csv_filename):
+        return cache
+    with open(csv_filename, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            name = row.get("name", "").strip()
+            url = row.get("url", "").strip()
+            if not name or not url:
+                continue
+            country = row.get("country", "").strip()
+            lat_s = row.get("lat", "").strip()
+            lon_s = row.get("lon", "").strip()
+            lat_k = float(lat_s) if lat_s else ""
+            lon_k = float(lon_s) if lon_s else ""
+            key = (name, country, lat_k, lon_k)
+            entry = {"url": url}
+            for field in ("routes_total", "routes_6a_6b", "routes_7a_7b",
+                          "routes_7c_8a"):
+                val = row.get(field, "").strip()
+                if val.isdigit():
+                    entry[field] = int(val)
+            for field in ("grade_min", "grade_max"):
+                val = row.get(field, "").strip()
+                if val:
+                    entry[field] = val
+            cache[key] = entry
+    print(f"📂 Loaded {len(cache)} 8a.nu entries from {csv_filename}")
+    return cache
+
+
+def a8_cache_save(cache, csv_filename):
+    with open(csv_filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=A8_CACHE_FIELDS)
+        writer.writeheader()
+        for key, entry in sorted(cache.items()):
+            entry = _a8_normalize_entry(entry)
+            name, country, lat_k, lon_k = _a8_cache_key_parts(key)
+            row = {
+                "name": name,
+                "country": country,
+                "lat": lat_k if lat_k != "" else "",
+                "lon": lon_k if lon_k != "" else "",
+                "url": entry.get("url", ""),
+                "routes_total": entry.get("routes_total", ""),
+                "grade_min": entry.get("grade_min", ""),
+                "grade_max": entry.get("grade_max", ""),
+                "routes_6a_6b": entry.get("routes_6a_6b", ""),
+                "routes_7a_7b": entry.get("routes_7a_7b", ""),
+                "routes_7c_8a": entry.get("routes_7c_8a", ""),
+            }
+            writer.writerow(row)
+    print(f"💾 8a.nu cache saved: {csv_filename}")
+
+
+def add_crag_legend(m):
+    legend_html = """
+    <div style="position: fixed; bottom: 24px; left: 24px; z-index: 9999;
+                background: white; padding: 8px 12px; border: 1px solid #ccc;
+                border-radius: 4px; font-size: 13px; line-height: 1.5;">
+      <b>Crags</b><br>
+      <span style="color:#2ecc71;">&#9679;</span> direct TheCrag / 8a.nu link<br>
+      <span style="color:#f1c40f;">&#9679;</span> 6a–6b+ &amp; 7a–7b+ &gt;3 routes each<br>
+      <span style="color:#e74c3c;">&#9679;</span> named (search links only)<br>
+      <span style="color:#7f8c8d;">&#9679;</span> unnamed<br>
+      <span style="color:#e67e22;">&#9679;</span> indoor gym
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+
+def add_crag_markers(m, locations, a8_cache=None, geocode_cache=None):
     for el in locations:
         tags = el.get("tags", {})
-        name = tags.get("int_name", tags.get("name:en", tags.get("name",
-                                                             "Unnamed crag")))
+        name = _crag_name_from_tags(tags)
         lat = el.get("lat") or el.get("center", {}).get("lat")
         lon = el.get("lon") or el.get("center", {}).get("lon")
 
@@ -181,18 +773,35 @@ def add_crag_markers(m, locations):
             """
             icon = folium.Icon(color="orange", icon="home", prefix="fa")
         else:
-            query_name = urllib.parse.quote(name)
-            thecrag_url = tags.get("climbing:url:thecrag",
-                        f"https://www.thecrag.com/search?S={query_name}#crags")
-            a8nu_url = f"https://www.8a.nu/search/crags?query={query_name}"
-            popup_html = f"""
-            <b>{name}</b><br>
-            📍 {lat:.4f}, {lon:.4f}<br>
-            <a href="{osm_url}" target="_blank">OpenStreetMap</a> |
-            <a href="{thecrag_url}" target="_blank">TheCrag</a> |
-            <a href="{a8nu_url}" target="_blank">8a.nu</a>
-            """
-            icon = folium.Icon(color="red", icon="flag")
+            thecrag_url, a8nu_url, a8_entry = _outdoor_crag_urls(
+                name, tags, a8_cache, lon=lon, lat=lat,
+                geocode_cache=geocode_cache)
+            stats_lines = []
+            osm_line = _format_osm_stats_line(_osm_crag_stats(tags))
+            if osm_line:
+                stats_lines.append(osm_line)
+            stats_lines.extend(_format_a8_stats_lines(a8_entry))
+            stats_html = ""
+            if stats_lines:
+                stats_html = "<br>" + "<br>".join(stats_lines)
+            if name:
+                popup_html = f"""
+                <b>{name}</b><br>
+                <br>
+                📍 {lat:.4f}, {lon:.4f}<br>
+                <a href="{osm_url}" target="_blank">OpenStreetMap</a> |
+                <a href="{thecrag_url}" target="_blank">TheCrag</a> |
+                <a href="{a8nu_url}" target="_blank">8a.nu</a>{stats_html}
+                """
+            else:
+                popup_html = f"""
+                <b>Unnamed crag</b><br>
+                <br>
+                📍 {lat:.4f}, {lon:.4f}<br>
+                <a href="{osm_url}" target="_blank">OpenStreetMap</a> |
+                """
+            icon = _crag_marker_icon(
+                name, thecrag_url, a8nu_url, a8_entry=a8_entry)
 
         folium.Marker(
             [lat, lon],
@@ -201,8 +810,10 @@ def add_crag_markers(m, locations):
         ).add_to(m)
 
 
-def build_and_save_map(m, locations, path):
-    add_crag_markers(m, locations)
+def build_and_save_map(m, locations, path, a8_cache=None, geocode_cache=None):
+    add_crag_markers(
+        m, locations, a8_cache=a8_cache, geocode_cache=geocode_cache)
+    add_crag_legend(m)
     folium.LayerControl().add_to(m)
     m.save(path)
     print(f"Map saved: {path} ({len(locations)} locations)")
@@ -432,8 +1043,14 @@ def _fetch_toll_elements(route_coords):
 
 
 NOMINATIM_HEADERS = {"User-Agent": "route-climbing-fetcher"}
+GEOCODE_CACHE_DECIMALS = 1  # ~10 km grid for reverse-geocode cache keys
 VIGNETTE_SAMPLE_KM = 40
 VIGNETTE_MAX_SAMPLES = 25
+
+
+def _geocode_cache_key(lat, lon):
+    return (round(lat, GEOCODE_CACHE_DECIMALS),
+            round(lon, GEOCODE_CACHE_DECIMALS))
 
 
 def vignette_load(csv_filename):
@@ -457,7 +1074,7 @@ def vignette_load(csv_filename):
 
 
 def geocode_cache_load(csv_filename):
-    """Load reverse-geocode cache keyed by (lat, lon) rounded to 3 decimals."""
+    """Load reverse-geocode cache keyed by (lat, lon) rounded to ~10 km."""
     cache = {}
     if not os.path.exists(csv_filename):
         return cache
@@ -465,8 +1082,8 @@ def geocode_cache_load(csv_filename):
         reader = csv.DictReader(f)
         for row in reader:
             try:
-                lat = round(float(row["lat"]), 3)
-                lon = round(float(row["lon"]), 3)
+                lat, lon = _geocode_cache_key(
+                    float(row["lat"]), float(row["lon"]))
                 code = row.get("country_code", "").strip().upper()
                 name = row.get("country", "").strip()
                 if code:
@@ -506,7 +1123,7 @@ def geocode_cache_save(cache, csv_filename):
 
 def reverse_country(lon, lat, cache):
     """Reverse-geocode a point; return (country_code, country_name) or None."""
-    key = (round(lat, 3), round(lon, 3))
+    key = _geocode_cache_key(lat, lon)
     if key in cache:
         return cache[key]
     url = "https://nominatim.openstreetmap.org/reverse"
@@ -520,6 +1137,21 @@ def reverse_country(lon, lat, cache):
     result = (code, name) if code else None
     cache[key] = result
     return result
+
+
+def _crag_country_slug(tags, lon, lat, geocode_cache):
+    """Map crag location to 8a.nu country slug (e.g. germany, austria)."""
+    for key in ("ISO3166-1:alpha2", "addr:country"):
+        val = tags.get(key, "").strip().upper()
+        if len(val) == 2:
+            slug = A8_COUNTRY_SLUG.get(val)
+            if slug:
+                return slug
+    if geocode_cache is not None and lon is not None and lat is not None:
+        result = reverse_country(lon, lat, geocode_cache)
+        if result:
+            return A8_COUNTRY_SLUG.get(result[0])
+    return None
 
 
 def sample_route_points(route_coords, interval_km=VIGNETTE_SAMPLE_KM,
@@ -734,112 +1366,153 @@ if __name__ == "__main__":
                         help="CSV file with per-country vignette prices")
     parser.add_argument("--geocode-cache", default="geocode_cache.csv",
                         help="CSV file to cache Nominatim reverse-geocode results")
+    parser.add_argument("--8a-cache", dest="a8_cache", default="8a_cache.csv",
+                        help="CSV file to cache 8a.nu URL lookups")
+    parser.add_argument("--no-8a-resolve", action="store_true",
+                        help="Skip 8a.nu search resolution; use search URLs only")
     args = parser.parse_args()
 
     city_start = args.start_city
     city_end = args.end_city
     search_buffer_km = args.buffer
 
-    start_lon, start_lat = geocode(city_start)
-    end_lon, end_lat = geocode(city_end)
-    print(f"Route: {city_start} → {city_end}")
-
-
-    # === STEP 2: Get route polyline via OSRM ===
-    osrm_url = f"https://router.project-osrm.org/route/v1/driving/{start_lon},{start_lat};{end_lon},{end_lat}"
-    resp = requests.get(osrm_url, params={"overview": "full", "geometries":
-                                      "geojson", "alternatives": "3" },
-                        headers={"User-Agent": "route-climbing-fetcher"})
-    resp.raise_for_status()
-    route = resp.json()["routes"][0]["geometry"]["coordinates"]
-    route_line = LineString([(lon, lat) for lon, lat in route])
-    routes = resp.json()["routes"]
-
-    # === STEP 3: Create buffer around route ===
-    project = pyproj.Transformer.from_crs("epsg:4326", "epsg:3857",
-                                          always_xy=True).transform
-    route_buffer = transform(project, route_line).buffer(search_buffer_km * 1000)
-    unproject = pyproj.Transformer.from_crs("epsg:3857", "epsg:4326",
-                                            always_xy=True).transform
-    route_buffer = transform(unproject, route_buffer)
-
-    # === STEP 4: Query Overpass API (chunked along route) ===
-    elements = fetch_crags_along_route(route, search_buffer_km)
-
-    # === STEP 5: Filter to only those inside buffer ===
-    def is_in_buffer(el):
-        lat = el.get("lat") or el.get("center", {}).get("lat")
-        lon = el.get("lon") or el.get("center", {}).get("lon")
-        if lat is None or lon is None:
-            return False
-        return route_buffer.contains(Point(lon, lat))
-
-
-    in_buffer = [el for el in elements if is_in_buffer(el)]
-    outdoor_crags = filter_locations(in_buffer, "crags")
-    all_with_gyms = filter_locations(in_buffer, "gym")
-    known_crags = filter_locations(in_buffer, "known")
-    gym_count = len(all_with_gyms) - len(outdoor_crags)
-    print(f"Found {len(in_buffer)} in buffer: {len(outdoor_crags)} outdoor, "
-          f"{gym_count} gyms; known={len(known_crags)}")
-
-    base = route_basename(city_start, city_end)
-    known_tolls = toll_load("jumper_tolls.csv")
-    vignettes = vignette_load(args.vignettes_csv)
     geocode_cache = geocode_cache_load(args.geocode_cache)
-    route_colors = ["blue", "orange", "purple", "red"]
+    a8_cache = None
+    try:
+        start_lon, start_lat = geocode(city_start)
+        end_lon, end_lat = geocode(city_end)
+        print(f"Route: {city_start} → {city_end}")
 
-    primary_tolls = None
-    route_costs = []
-    for i, r in enumerate(routes):
-        route_coords = r["geometry"]["coordinates"]
-        label = i + 1
-        dist_km = r["distance"] / 1000
-        dur_h = r["duration"] / 60 / 60
-        print(f"\n=== Route {label} ===")
-        print(f"distance: {dist_km:.1f} km, duration: {dur_h:.2f} h")
+        # === STEP 2: Get route polyline via OSRM ===
+        osrm_url = f"https://router.project-osrm.org/route/v1/driving/{start_lon},{start_lat};{end_lon},{end_lat}"
+        resp = requests.get(osrm_url, params={"overview": "full", "geometries":
+                                          "geojson", "alternatives": "3" },
+                            headers={"User-Agent": "route-climbing-fetcher"})
+        resp.raise_for_status()
+        route = resp.json()["routes"][0]["geometry"]["coordinates"]
+        route_line = LineString([(lon, lat) for lon, lat in route])
+        routes = resp.json()["routes"]
 
-        toll_total, route_tolls = calc_toll_cost(
-            route_coords, fmap=None, known_tolls=known_tolls, label=label)
-        if i == 0:
-            primary_tolls = route_tolls
-        vignette_total = calc_vignette_cost(
-            route_coords, vignettes=vignettes,
-            geocode_cache=geocode_cache, label=label)
-        fuel_total = calc_fuel_cost(dist_km, label=label)
-        fuel_liters = (dist_km / 100) * consumption
-        total_cost = toll_total + vignette_total + fuel_total
-        route_costs.append({
-            "label": label,
-            "dist_km": dist_km,
-            "dur_h": dur_h,
-            "tolls": toll_total,
-            "vignettes": vignette_total,
-            "fuel": fuel_total,
-            "fuel_liters": fuel_liters,
-            "total": total_cost,
-        })
-        print(f"Total travel cost (tolls + vignettes + fuel): "
-              f"{total_cost:.2f} EUR")
+        # === STEP 3: Create buffer around route ===
+        project = pyproj.Transformer.from_crs("epsg:4326", "epsg:3857",
+                                              always_xy=True).transform
+        route_buffer = transform(project, route_line).buffer(search_buffer_km * 1000)
+        unproject = pyproj.Transformer.from_crs("epsg:3857", "epsg:4326",
+                                                always_xy=True).transform
+        route_buffer = transform(unproject, route_buffer)
 
-    print_route_cost_summary(route_costs)
+        # === STEP 4: Query Overpass API (chunked along route) ===
+        elements = fetch_crags_along_route(route, search_buffer_km)
 
-    if not args.no_map:
-        center_lat = (start_lat + end_lat) / 2
-        center_lon = (start_lon + end_lon) / 2
-        variants = [
-            ("crags", outdoor_crags),
-            ("crags_gym", all_with_gyms),
-            ("crags_known", known_crags),
-        ]
-        for idx, (suffix, locations) in enumerate(variants):
-            m = create_base_map(center_lat, center_lon)
-            add_route_layers(
-                m, routes, route_buffer, search_buffer_km, route_colors,
-                start_lat, start_lon, end_lat, end_lon, city_start, city_end)
-            if idx == 0 and primary_tolls:
-                add_toll_markers(m, primary_tolls)
-            build_and_save_map(m, locations, f"{base}_{suffix}.html")
+        # === STEP 5: Filter to only those inside buffer ===
+        def is_in_buffer(el):
+            lat = el.get("lat") or el.get("center", {}).get("lat")
+            lon = el.get("lon") or el.get("center", {}).get("lon")
+            if lat is None or lon is None:
+                return False
+            return route_buffer.contains(Point(lon, lat))
 
-    save_crags_to_gpx(outdoor_crags, f"{base}_crags.gpx")
-    geocode_cache_save(geocode_cache, args.geocode_cache)
+        in_buffer = [el for el in elements if is_in_buffer(el)]
+        outdoor_crags = filter_locations(in_buffer, "crags")
+        all_with_gyms = filter_locations(in_buffer, "gym")
+        known_crags = filter_locations(in_buffer, "known")
+        gym_count = len(all_with_gyms) - len(outdoor_crags)
+        print(f"Found {len(in_buffer)} in buffer: {len(outdoor_crags)} outdoor, "
+              f"{gym_count} gyms; known={len(known_crags)}")
+
+        base = route_basename(city_start, city_end)
+        known_tolls = toll_load("jumper_tolls.csv")
+        vignettes = vignette_load(args.vignettes_csv)
+        route_colors = ["blue", "orange", "purple", "red"]
+
+        primary_tolls = None
+        route_costs = []
+        for i, r in enumerate(routes):
+            route_coords = r["geometry"]["coordinates"]
+            label = i + 1
+            dist_km = r["distance"] / 1000
+            dur_h = r["duration"] / 60 / 60
+            print(f"\n=== Route {label} ===")
+            print(f"distance: {dist_km:.1f} km, duration: {dur_h:.2f} h")
+
+            toll_total, route_tolls = calc_toll_cost(
+                route_coords, fmap=None, known_tolls=known_tolls, label=label)
+            if i == 0:
+                primary_tolls = route_tolls
+            vignette_total = calc_vignette_cost(
+                route_coords, vignettes=vignettes,
+                geocode_cache=geocode_cache, label=label)
+            fuel_total = calc_fuel_cost(dist_km, label=label)
+            fuel_liters = (dist_km / 100) * consumption
+            total_cost = toll_total + vignette_total + fuel_total
+            route_costs.append({
+                "label": label,
+                "dist_km": dist_km,
+                "dur_h": dur_h,
+                "tolls": toll_total,
+                "vignettes": vignette_total,
+                "fuel": fuel_total,
+                "fuel_liters": fuel_liters,
+                "total": total_cost,
+            })
+            print(f"Total travel cost (tolls + vignettes + fuel): "
+                  f"{total_cost:.2f} EUR")
+
+        print_route_cost_summary(route_costs)
+
+        if not args.no_map and not args.no_8a_resolve:
+            a8_cache = a8_cache_load(args.a8_cache)
+            variants_for_names = [
+                outdoor_crags,
+                all_with_gyms,
+                known_crags,
+            ]
+            to_resolve = set()
+            for locations in variants_for_names:
+                for el in locations:
+                    tags = el.get("tags", {})
+                    if is_indoor_gym(tags):
+                        continue
+                    name = _crag_name_from_tags(tags)
+                    if not name:
+                        continue
+                    lat = el.get("lat") or el.get("center", {}).get("lat")
+                    lon = el.get("lon") or el.get("center", {}).get("lon")
+                    if _a8_lookup_entry(name, a8_cache, lat=lat, lon=lon):
+                        continue
+                    country_slug = _crag_country_slug(
+                        tags, lon, lat, geocode_cache)
+                    if cached and _a8_entry_needs_stats(cached):
+                        to_resolve.add((name, country_slug, lat, lon))
+                        continue
+                    key = _a8_cache_key(name, country_slug, lat, lon)
+                    if key not in a8_cache:
+                        to_resolve.add((name, country_slug, lat, lon))
+            for name, country_slug, lat, lon in sorted(to_resolve):
+                resolve_8a_nu_url(
+                    name, a8_cache, country_slug=country_slug, lat=lat, lon=lon)
+
+        if not args.no_map:
+            center_lat = (start_lat + end_lat) / 2
+            center_lon = (start_lon + end_lon) / 2
+            variants = [
+                ("crags", outdoor_crags),
+                ("crags_gym", all_with_gyms),
+                ("crags_known", known_crags),
+            ]
+            for idx, (suffix, locations) in enumerate(variants):
+                m = create_base_map(center_lat, center_lon)
+                add_route_layers(
+                    m, routes, route_buffer, search_buffer_km, route_colors,
+                    start_lat, start_lon, end_lat, end_lon, city_start, city_end)
+                if idx == 0 and primary_tolls:
+                    add_toll_markers(m, primary_tolls)
+                build_and_save_map(
+                    m, locations, f"{base}_{suffix}.html",
+                    a8_cache=a8_cache, geocode_cache=geocode_cache)
+
+        save_crags_to_gpx(outdoor_crags, f"{base}_crags.gpx")
+    finally:
+        geocode_cache_save(geocode_cache, args.geocode_cache)
+        if a8_cache is not None:
+            a8_cache_save(a8_cache, args.a8_cache)
