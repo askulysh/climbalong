@@ -40,6 +40,7 @@ OVERPASS_URLS = [
 OVERPASS_HEADERS = {"User-Agent": "route-climbing-fetcher"}
 A8_BASE = "https://www.8a.nu"
 A8_MATCH_RADIUS_KM = 10
+TOILET_SEARCH_RADIUS_KM = 10
 A8_LINK_RE = re.compile(
     r'<a href="(/crags/sportclimbing/[^"]+/routes)"[^>]*>([^<]+)</a>',
     re.I)
@@ -746,13 +747,28 @@ def add_crag_legend(m):
       <span style="color:#f1c40f;">&#9679;</span> 6a–6b+ &amp; 7a–7b+ &gt;3 routes each<br>
       <span style="color:#e74c3c;">&#9679;</span> named (search links only)<br>
       <span style="color:#7f8c8d;">&#9679;</span> unnamed<br>
-      <span style="color:#e67e22;">&#9679;</span> indoor gym
+      <span style="color:#e67e22;">&#9679;</span> indoor gym<br>
+      <span style="color:#5f9ea0;">&#9679;</span> nearest toilet (within 10 km)
     </div>
     """
     m.get_root().html.add_child(folium.Element(legend_html))
 
 
-def add_crag_markers(m, locations, a8_cache=None, geocode_cache=None):
+def _format_toilet_line(nearest_info):
+    if not nearest_info:
+        return None
+    toilet = nearest_info["toilet"]
+    name = toilet["name"] or "Unnamed toilet"
+    dist = nearest_info["distance_km"]
+    osm_url = f"https://www.openstreetmap.org/{toilet['type']}/{toilet['id']}"
+    return (
+        f'Nearest toilet: <a href="{osm_url}" target="_blank">{name}</a>, '
+        f"{dist:.1f} km"
+    )
+
+
+def add_crag_markers(m, locations, a8_cache=None, geocode_cache=None,
+                     nearest_toilets=None):
     for el in locations:
         tags = el.get("tags", {})
         name = _crag_name_from_tags(tags)
@@ -781,6 +797,11 @@ def add_crag_markers(m, locations, a8_cache=None, geocode_cache=None):
             if osm_line:
                 stats_lines.append(osm_line)
             stats_lines.extend(_format_a8_stats_lines(a8_entry))
+            toilet_line = _format_toilet_line(
+                nearest_toilets.get((el["type"], el["id"]))
+                if nearest_toilets else None)
+            if toilet_line:
+                stats_lines.append(toilet_line)
             stats_html = ""
             if stats_lines:
                 stats_html = "<br>" + "<br>".join(stats_lines)
@@ -810,9 +831,43 @@ def add_crag_markers(m, locations, a8_cache=None, geocode_cache=None):
         ).add_to(m)
 
 
-def build_and_save_map(m, locations, path, a8_cache=None, geocode_cache=None):
+def add_toilet_markers(m, nearest_toilets):
+    if not nearest_toilets:
+        return
+    by_toilet = {}
+    for info in nearest_toilets.values():
+        toilet = info["toilet"]
+        key = (toilet["type"], toilet["id"])
+        if key not in by_toilet:
+            by_toilet[key] = {"toilet": toilet, "crags": []}
+        by_toilet[key]["crags"].append(info["crag_name"])
+
+    group = folium.FeatureGroup(name="Toilets", show=True)
+    for data in by_toilet.values():
+        toilet = data["toilet"]
+        name = toilet["name"] or "Unnamed toilet"
+        osm_url = (
+            f"https://www.openstreetmap.org/{toilet['type']}/{toilet['id']}")
+        crags = sorted(set(data["crags"]))
+        crags_html = f"<br>Nearest for: {', '.join(crags)}"
+        popup_html = f"""
+        <b>{name}</b><br>
+        <a href="{osm_url}" target="_blank">OpenStreetMap</a>{crags_html}
+        """
+        folium.Marker(
+            [toilet["lat"], toilet["lon"]],
+            popup=folium.Popup(popup_html, max_width=300),
+            icon=folium.Icon(color="cadetblue", icon="info-sign"),
+        ).add_to(group)
+    group.add_to(m)
+
+
+def build_and_save_map(m, locations, path, a8_cache=None, geocode_cache=None,
+                       nearest_toilets=None):
     add_crag_markers(
-        m, locations, a8_cache=a8_cache, geocode_cache=geocode_cache)
+        m, locations, a8_cache=a8_cache, geocode_cache=geocode_cache,
+        nearest_toilets=nearest_toilets)
+    add_toilet_markers(m, nearest_toilets)
     add_crag_legend(m)
     folium.LayerControl().add_to(m)
     m.save(path)
@@ -999,6 +1054,116 @@ def fetch_crags_along_route(route_coords, buffer_km, segment_km=CRAG_SEGMENT_KM)
             merged[(el["type"], el["id"])] = el
 
     return list(merged.values())
+
+
+def _element_latlon(el):
+    lat = el.get("lat") or el.get("center", {}).get("lat")
+    lon = el.get("lon") or el.get("center", {}).get("lon")
+    if lat is None or lon is None:
+        return None, None
+    return lat, lon
+
+
+def _toilet_access_ok(tags):
+    access = tags.get("access", "").strip().lower()
+    return not access or access == "yes"
+
+
+def _normalize_toilet(el):
+    lat, lon = _element_latlon(el)
+    if lat is None:
+        return None
+    tags = el.get("tags", {})
+    if not _toilet_access_ok(tags):
+        return None
+    return {
+        "id": el["id"],
+        "type": el["type"],
+        "lat": lat,
+        "lon": lon,
+        "name": tags.get("name", "").strip(),
+        "tags": tags,
+    }
+
+
+def _toilet_bbox_query(min_lat, min_lon, max_lat, max_lon, timeout=90):
+    b = f"{min_lat},{min_lon},{max_lat},{max_lon}"
+    return f"""
+    [out:json][timeout:{timeout}];
+    (
+      node["amenity"="toilets"]["access"="yes"]({b});
+      node["amenity"="toilets"][!"access"]({b});
+      node["amenity"="toilet"]["access"="yes"]({b});
+      node["amenity"="toilet"][!"access"]({b});
+      way["amenity"="toilets"]["access"="yes"]({b});
+      way["amenity"="toilets"][!"access"]({b});
+      way["amenity"="toilet"]["access"="yes"]({b});
+      way["amenity"="toilet"][!"access"]({b});
+    );
+    out center;
+    """
+
+
+def fetch_toilets_along_route(route_coords, buffer_km,
+                              toilet_radius_km=TOILET_SEARCH_RADIUS_KM,
+                              segment_km=CRAG_SEGMENT_KM):
+    """Fetch amenity=toilets/toilet along route with expanded search bbox."""
+    expand_km = buffer_km + toilet_radius_km
+    project = pyproj.Transformer.from_crs("epsg:4326", "epsg:3857",
+                                          always_xy=True).transform
+    unproject = pyproj.Transformer.from_crs("epsg:3857", "epsg:4326",
+                                            always_xy=True).transform
+    merged = {}
+    segments = list(iter_route_segments(route_coords, segment_km))
+    total = len(segments)
+
+    for i, seg_coords in enumerate(segments):
+        print(f"Toilet segment {i + 1}/{total}...")
+        seg_line = LineString(seg_coords)
+        seg_buffer = transform(
+            unproject, transform(project, seg_line).buffer(expand_km * 1000))
+        min_lon, min_lat, max_lon, max_lat = seg_buffer.bounds
+        query = _toilet_bbox_query(min_lat, min_lon, max_lat, max_lon)
+        elements = overpass_post(query)
+        for el in elements:
+            merged[(el["type"], el["id"])] = el
+
+    toilets = []
+    for el in merged.values():
+        normalized = _normalize_toilet(el)
+        if normalized:
+            toilets.append(normalized)
+    print(f"Found {len(toilets)} toilets in search area")
+    return toilets
+
+
+def nearest_toilets_for_crags(outdoor_crags, toilets,
+                               radius_km=TOILET_SEARCH_RADIUS_KM):
+    """Map crag (type, id) -> {toilet, distance_km, crag_name}."""
+    result = {}
+    if not toilets:
+        return result
+    for el in outdoor_crags:
+        if is_indoor_gym(el.get("tags", {})):
+            continue
+        lat, lon = _element_latlon(el)
+        if lat is None:
+            continue
+        best = None
+        best_dist = None
+        for toilet in toilets:
+            dist = _haversine_km(lat, lon, toilet["lat"], toilet["lon"])
+            if dist <= radius_km and (best_dist is None or dist < best_dist):
+                best_dist = dist
+                best = toilet
+        if best is not None:
+            crag_name = _crag_name_from_tags(el.get("tags", {})) or "Unnamed crag"
+            result[(el["type"], el["id"])] = {
+                "toilet": best,
+                "distance_km": best_dist,
+                "crag_name": crag_name,
+            }
+    return result
 
 
 def _toll_around_coords(route_coords):
@@ -1370,6 +1535,8 @@ if __name__ == "__main__":
                         help="CSV file to cache 8a.nu URL lookups")
     parser.add_argument("--no-8a-resolve", action="store_true",
                         help="Skip 8a.nu search resolution; use search URLs only")
+    parser.add_argument("--no-toilets", action="store_true",
+                        help="Skip nearest-toilet lookup and map markers")
     args = parser.parse_args()
 
     city_start = args.start_city
@@ -1419,6 +1586,15 @@ if __name__ == "__main__":
         gym_count = len(all_with_gyms) - len(outdoor_crags)
         print(f"Found {len(in_buffer)} in buffer: {len(outdoor_crags)} outdoor, "
               f"{gym_count} gyms; known={len(known_crags)}")
+
+        nearest_toilets = {}
+        if not args.no_map and not args.no_toilets:
+            try:
+                toilets = fetch_toilets_along_route(route, search_buffer_km)
+                nearest_toilets = nearest_toilets_for_crags(outdoor_crags, toilets)
+                print(f"Nearest toilets found for {len(nearest_toilets)} outdoor crags")
+            except RuntimeError as exc:
+                print(f"Warning: toilet lookup failed: {exc}")
 
         base = route_basename(city_start, city_end)
         known_tolls = toll_load("jumper_tolls.csv")
@@ -1509,7 +1685,8 @@ if __name__ == "__main__":
                     add_toll_markers(m, primary_tolls)
                 build_and_save_map(
                     m, locations, f"{base}_{suffix}.html",
-                    a8_cache=a8_cache, geocode_cache=geocode_cache)
+                    a8_cache=a8_cache, geocode_cache=geocode_cache,
+                    nearest_toilets=nearest_toilets)
 
         save_crags_to_gpx(outdoor_crags, f"{base}_crags.gpx")
     finally:
