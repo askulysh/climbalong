@@ -1,0 +1,15 @@
+# Climbing route planner — Ubuntu / Raspberry Pi (Python 3.10+)
+#
+#   sudo apt update
+#   sudo apt install -y python3-pip python3-venv openssl
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -U pip
+#   pip install -r requirements.txt
+#
+# If shapely/pyproj fail to build on older Pi OS, also try:
+#   sudo apt install -y python3-shapely python3-pyproj gdal-bin libgeos-dev
+
+requests>=2.31
+folium>=0.15
+shapely>=2.0
+pyproj>=3.6

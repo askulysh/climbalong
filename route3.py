@@ -5,6 +5,7 @@ from shapely.geometry import LineString, Point
 from shapely.ops import substring, transform
 import pyproj
 import folium
+from folium.plugins import LocateControl
 import urllib.parse
 import xml.etree.ElementTree as ET
 import re
@@ -41,6 +42,11 @@ OVERPASS_HEADERS = {"User-Agent": "route-climbing-fetcher"}
 A8_BASE = "https://www.8a.nu"
 A8_MATCH_RADIUS_KM = 10
 TOILET_SEARCH_RADIUS_KM = 10
+P4N_BASE = "https://guest.park4night.com/services/V4.1"
+P4N_WEB_BASE = "https://park4night.com/en"
+P4N_SEARCH_RADIUS_KM = 10
+P4N_PARKING_CODES = frozenset({"P", "A"})
+P4N_HEADERS = {"User-Agent": "route-climbing-fetcher"}
 A8_LINK_RE = re.compile(
     r'<a href="(/crags/sportclimbing/[^"]+/routes(?:\?[^"]*)?)"[^>]*>([^<]+)</a>',
     re.I)
@@ -173,6 +179,12 @@ def create_base_map(center_lat, center_lon):
         attr='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
         referrerPolicy="no-referrer-when-downgrade"
     ).add_to(m)
+    LocateControl(
+        auto_start=False,
+        position="topleft",
+        strings={"title": "My location", "popup": "You are here"},
+        locateOptions={"enableHighAccuracy": True, "maxZoom": 16},
+    ).add_to(m)
     return m
 
 
@@ -191,10 +203,35 @@ def add_route_layers(m, routes, route_buffer, search_buffer_km, route_colors,
                    color="green", weight=1, fill=True, fill_opacity=0.1,
                    tooltip=f"Search area ±{search_buffer_km} km").add_to(m)
 
-    folium.Marker([start_lat, start_lon], popup=f"Start: {city_start}",
-                  icon=folium.Icon(color="green")).add_to(m)
-    folium.Marker([end_lat, end_lon], popup=f"End: {city_end}",
-                  icon=folium.Icon(color="blue")).add_to(m)
+    start_popup = (
+        f"<b>Start: {city_start}</b><br>"
+        f"{_nav_links_html(start_lat, start_lon, city_start)}"
+    )
+    end_popup = (
+        f"<b>End: {city_end}</b><br>"
+        f"{_nav_links_html(end_lat, end_lon, city_end)}"
+    )
+    folium.Marker(
+        [start_lat, start_lon],
+        popup=folium.Popup(start_popup, max_width=320),
+        icon=folium.Icon(color="green"),
+    ).add_to(m)
+    folium.Marker(
+        [end_lat, end_lon],
+        popup=folium.Popup(end_popup, max_width=320),
+        icon=folium.Icon(color="blue"),
+    ).add_to(m)
+
+
+def _nav_links_html(lat, lon, name=None):
+    dest = f"{lat},{lon}"
+    gmaps = f"https://www.google.com/maps/dir/?api=1&destination={dest}"
+    label = urllib.parse.quote(name) if name else dest
+    geo = f"geo:{lat},{lon}?q={lat},{lon}({label})"
+    return (
+        f'<a href="{gmaps}" target="_blank">Google Maps</a> | '
+        f'<a href="{geo}">Android nav</a>'
+    )
 
 
 def add_toll_markers(fmap, nearby_tolls):
@@ -203,11 +240,12 @@ def add_toll_markers(fmap, nearby_tolls):
         popup_html = f"""
         <b>{t['name']}</b><br>
         Fee: {t['fee']} {t['currency']}<br>
-        <a href="{osm_link}" target="_blank">OpenStreetMap</a>
+        <a href="{osm_link}" target="_blank">OpenStreetMap</a><br>
+        {_nav_links_html(t['lat'], t['lon'], t['name'])}
         """
         folium.Marker(
             [t["lat"], t["lon"]],
-            popup=popup_html,
+            popup=folium.Popup(popup_html, max_width=320),
             tooltip=f"{t['name']} ({t['fee']} {t['currency']})",
             icon=folium.Icon(color="blue", icon="road", prefix="fa")
         ).add_to(fmap)
@@ -816,7 +854,8 @@ def add_crag_legend(m):
       <span style="color:#e74c3c;">&#9679;</span> named (search links only)<br>
       <span style="color:#7f8c8d;">&#9679;</span> unnamed<br>
       <span style="color:#e67e22;">&#9679;</span> indoor gym<br>
-      <span style="color:#5f9ea0;">&#9679;</span> nearest toilet (within 10 km)
+      <span style="color:#5f9ea0;">&#9679;</span> nearest toilet (within 10 km)<br>
+      <span style="color:#663399;">&#9679;</span> nearest parking (beige or toilet-shown crags)
     </div>
     """
     m.get_root().html.add_child(folium.Element(legend_html))
@@ -835,8 +874,21 @@ def _format_toilet_line(nearest_info):
     )
 
 
+def _format_parking_line(nearest_info):
+    if not nearest_info:
+        return None
+    place = nearest_info["place"]
+    name = place["name"] or place.get("titre") or "Unnamed parking"
+    dist = nearest_info["distance_km"]
+    url = _p4n_place_url(place["id"])
+    return (
+        f'Nearest parking: <a href="{url}" target="_blank">{name}</a>, '
+        f"{dist:.1f} km"
+    )
+
+
 def add_crag_markers(m, locations, a8_cache=None, geocode_cache=None,
-                     nearest_toilets=None):
+                     nearest_toilets=None, nearest_parking=None):
     for el in locations:
         tags = el.get("tags", {})
         name = _crag_name_from_tags(tags)
@@ -853,7 +905,8 @@ def add_crag_markers(m, locations, a8_cache=None, geocode_cache=None,
             popup_html = f"""
             <b>{name}</b><br>
             📍 {lat:.4f}, {lon:.4f}<br>
-            {links}
+            {links}<br>
+            {_nav_links_html(lat, lon, name)}
             """
             icon = folium.Icon(color="orange", icon="home", prefix="fa")
         else:
@@ -870,6 +923,11 @@ def add_crag_markers(m, locations, a8_cache=None, geocode_cache=None,
                 if nearest_toilets else None)
             if toilet_line:
                 stats_lines.append(toilet_line)
+            parking_line = _format_parking_line(
+                nearest_parking.get((el["type"], el["id"]))
+                if nearest_parking else None)
+            if parking_line:
+                stats_lines.append(parking_line)
             stats_html = ""
             if stats_lines:
                 stats_html = "<br>" + "<br>".join(stats_lines)
@@ -880,21 +938,23 @@ def add_crag_markers(m, locations, a8_cache=None, geocode_cache=None,
                 📍 {lat:.4f}, {lon:.4f}<br>
                 <a href="{osm_url}" target="_blank">OpenStreetMap</a> |
                 <a href="{thecrag_url}" target="_blank">TheCrag</a> |
-                <a href="{a8nu_url}" target="_blank">8a.nu</a>{stats_html}
+                <a href="{a8nu_url}" target="_blank">8a.nu</a>{stats_html}<br>
+                {_nav_links_html(lat, lon, name)}
                 """
             else:
                 popup_html = f"""
                 <b>Unnamed crag</b><br>
                 <br>
                 📍 {lat:.4f}, {lon:.4f}<br>
-                <a href="{osm_url}" target="_blank">OpenStreetMap</a> |
+                <a href="{osm_url}" target="_blank">OpenStreetMap</a><br>
+                {_nav_links_html(lat, lon)}
                 """
             icon = _crag_marker_icon(
                 name, thecrag_url, a8nu_url, a8_entry=a8_entry)
 
         folium.Marker(
             [lat, lon],
-            popup=folium.Popup(popup_html, max_width=300),
+            popup=folium.Popup(popup_html, max_width=320),
             icon=icon
         ).add_to(m)
 
@@ -920,22 +980,55 @@ def add_toilet_markers(m, nearest_toilets):
         crags_html = f"<br>Nearest for: {', '.join(crags)}"
         popup_html = f"""
         <b>{name}</b><br>
-        <a href="{osm_url}" target="_blank">OpenStreetMap</a>{crags_html}
+        <a href="{osm_url}" target="_blank">OpenStreetMap</a>{crags_html}<br>
+        {_nav_links_html(toilet["lat"], toilet["lon"], name)}
         """
         folium.Marker(
             [toilet["lat"], toilet["lon"]],
-            popup=folium.Popup(popup_html, max_width=300),
+            popup=folium.Popup(popup_html, max_width=320),
             icon=folium.Icon(color="cadetblue", icon="info-sign"),
         ).add_to(group)
     group.add_to(m)
 
 
+def add_parking_markers(m, nearest_parking):
+    if not nearest_parking:
+        return
+    by_place = {}
+    for info in nearest_parking.values():
+        place = info["place"]
+        key = place["id"]
+        if key not in by_place:
+            by_place[key] = {"place": place, "crags": []}
+        by_place[key]["crags"].append(info["crag_name"])
+
+    group = folium.FeatureGroup(name="Parking", show=True)
+    for data in by_place.values():
+        place = data["place"]
+        name = place["name"] or place.get("titre") or "Unnamed parking"
+        url = _p4n_place_url(place["id"])
+        crags = sorted(set(data["crags"]))
+        crags_html = f"<br>Nearest for: {', '.join(crags)}"
+        popup_html = f"""
+        <b>{name}</b><br>
+        <a href="{url}" target="_blank">park4night</a>{crags_html}<br>
+        {_nav_links_html(place["lat"], place["lon"], name)}
+        """
+        folium.Marker(
+            [place["lat"], place["lon"]],
+            popup=folium.Popup(popup_html, max_width=320),
+            icon=folium.Icon(color="darkpurple", icon="car", prefix="fa"),
+        ).add_to(group)
+    group.add_to(m)
+
+
 def build_and_save_map(m, locations, path, a8_cache=None, geocode_cache=None,
-                       nearest_toilets=None):
+                       nearest_toilets=None, nearest_parking=None):
     add_crag_markers(
         m, locations, a8_cache=a8_cache, geocode_cache=geocode_cache,
-        nearest_toilets=nearest_toilets)
+        nearest_toilets=nearest_toilets, nearest_parking=nearest_parking)
     add_toilet_markers(m, nearest_toilets)
+    add_parking_markers(m, nearest_parking)
     add_crag_legend(m)
     folium.LayerControl().add_to(m)
     m.save(path)
@@ -1228,6 +1321,122 @@ def nearest_toilets_for_crags(outdoor_crags, toilets,
             crag_name = _crag_name_from_tags(el.get("tags", {})) or "Unnamed crag"
             result[(el["type"], el["id"])] = {
                 "toilet": best,
+                "distance_km": best_dist,
+                "crag_name": crag_name,
+            }
+    return result
+
+
+def _p4n_place_url(place_id):
+    return f"{P4N_WEB_BASE}/place/{place_id}"
+
+
+def _is_p4n_parking(place):
+    return place.get("code") in P4N_PARKING_CODES
+
+
+def _normalize_p4n_place(raw):
+    try:
+        lat = float(raw["latitude"])
+        lon = float(raw["longitude"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    name = (raw.get("name") or raw.get("titre") or "").strip()
+    dist_s = raw.get("distance", "")
+    try:
+        distance_km = float(dist_s) if dist_s not in ("", None) else None
+    except ValueError:
+        distance_km = None
+    return {
+        "id": str(raw["id"]),
+        "lat": lat,
+        "lon": lon,
+        "name": name,
+        "code": raw.get("code", ""),
+        "distance_km": distance_km,
+        "titre": (raw.get("titre") or "").strip(),
+    }
+
+
+def fetch_park4night_places(lat, lon):
+    resp = requests.get(
+        f"{P4N_BASE}/lieuxGetFilter.php",
+        params={"latitude": lat, "longitude": lon},
+        headers=P4N_HEADERS,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    lieux = resp.json().get("lieux") or []
+    places = []
+    for raw in lieux:
+        place = _normalize_p4n_place(raw)
+        if place and _is_p4n_parking(place):
+            places.append(place)
+    return places
+
+
+def highlighted_outdoor_crags(outdoor_crags, a8_cache, geocode_cache):
+    highlighted = []
+    for el in outdoor_crags:
+        if is_indoor_gym(el.get("tags", {})):
+            continue
+        tags = el.get("tags", {})
+        name = _crag_name_from_tags(tags)
+        lat = el.get("lat") or el.get("center", {}).get("lat")
+        lon = el.get("lon") or el.get("center", {}).get("lon")
+        if not name or lat is None or lon is None:
+            continue
+        a8_entry = _a8_lookup_entry(name, a8_cache, lat=lat, lon=lon)
+        if a8_entry is None:
+            country_slug = _crag_country_slug(tags, lon, lat, geocode_cache)
+            a8_entry = _a8_lookup_entry(
+                name, a8_cache, country_slug, lat, lon)
+        if _a8_highlight_bands(a8_entry):
+            highlighted.append(el)
+    return highlighted
+
+
+def outdoor_crags_for_p4n_parking(outdoor_crags, a8_cache, geocode_cache,
+                                  nearest_toilets):
+    """Beige outdoor crags plus crags with a nearest OSM toilet, deduped."""
+    by_key = {}
+    for el in highlighted_outdoor_crags(outdoor_crags, a8_cache, geocode_cache):
+        by_key[(el["type"], el["id"])] = el
+    toilet_keys = set(nearest_toilets or {})
+    for el in outdoor_crags:
+        key = (el["type"], el["id"])
+        if key in toilet_keys and key not in by_key:
+            if not is_indoor_gym(el.get("tags", {})):
+                by_key[key] = el
+    return list(by_key.values())
+
+
+def nearest_parking_for_crags(crags, radius_km=P4N_SEARCH_RADIUS_KM):
+    """Map crag (type, id) -> {place, distance_km, crag_name}."""
+    result = {}
+    places_cache = {}
+    for el in crags:
+        lat, lon = _element_latlon(el)
+        if lat is None:
+            continue
+        cache_key = _geocode_cache_key(lat, lon)
+        if cache_key not in places_cache:
+            places_cache[cache_key] = fetch_park4night_places(lat, lon)
+            time.sleep(0.3)
+        places = places_cache[cache_key]
+        best = None
+        best_dist = None
+        for place in places:
+            dist = place.get("distance_km")
+            if dist is None:
+                dist = _haversine_km(lat, lon, place["lat"], place["lon"])
+            if dist <= radius_km and (best_dist is None or dist < best_dist):
+                best_dist = dist
+                best = place
+        if best is not None:
+            crag_name = _crag_name_from_tags(el.get("tags", {})) or "Unnamed crag"
+            result[(el["type"], el["id"])] = {
+                "place": best,
                 "distance_km": best_dist,
                 "crag_name": crag_name,
             }
@@ -1585,34 +1794,21 @@ def calc_toll_cost(route, fmap=None, known_tolls=None, label=None):
     return total_cost, nearby_tolls
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Calculate toll cost between two cities using OSM data.")
-    parser.add_argument("start_city", help="Name of the start city")
-    parser.add_argument("end_city", help="Name of the end city")
-    parser.add_argument("--buffer", type=float, default=10,
-                        help="Buffer distance (km) around route for crag search")
-    parser.add_argument("--csv", default="tolls.csv",
-                        help="CSV file to store toll data")
-    parser.add_argument("--no-map", action="store_true",
-                        help="Disable map output")
-    parser.add_argument("--vignettes-csv", default="vignettes.csv",
-                        help="CSV file with per-country vignette prices")
-    parser.add_argument("--geocode-cache", default="geocode_cache.csv",
-                        help="CSV file to cache Nominatim reverse-geocode results")
-    parser.add_argument("--8a-cache", dest="a8_cache", default="8a_cache.csv",
-                        help="CSV file to cache 8a.nu URL lookups")
-    parser.add_argument("--no-8a-resolve", action="store_true",
-                        help="Skip 8a.nu search resolution; use search URLs only")
-    parser.add_argument("--no-toilets", action="store_true",
-                        help="Skip nearest-toilet lookup and map markers")
-    args = parser.parse_args()
+def run_route(start_city, end_city, *, buffer_km=10, vignettes_csv="vignettes.csv",
+              geocode_cache_path="geocode_cache.csv", a8_cache_path="8a_cache.csv",
+              no_map=False, no_8a_resolve=False, no_toilets=False, no_parking=False):
+    """Generate crag maps and GPX for a driving route between two cities.
 
-    city_start = args.start_city
-    city_end = args.end_city
-    search_buffer_km = args.buffer
+    Returns a dict with ``base`` (filename basename) and ``paths`` (written files).
+    """
+    city_start = start_city
+    city_end = end_city
+    search_buffer_km = buffer_km
 
-    geocode_cache = geocode_cache_load(args.geocode_cache)
+    geocode_cache = geocode_cache_load(geocode_cache_path)
     a8_cache = None
+    paths = []
+    base = route_basename(city_start, city_end)
     try:
         start_lon, start_lat = geocode(city_start)
         end_lon, end_lat = geocode(city_end)
@@ -1656,7 +1852,7 @@ if __name__ == "__main__":
               f"{gym_count} gyms; known={len(known_crags)}")
 
         nearest_toilets = {}
-        if not args.no_map and not args.no_toilets:
+        if not no_map and not no_toilets:
             try:
                 toilets = fetch_toilets_along_route(route, search_buffer_km)
                 nearest_toilets = nearest_toilets_for_crags(outdoor_crags, toilets)
@@ -1664,9 +1860,8 @@ if __name__ == "__main__":
             except RuntimeError as exc:
                 print(f"Warning: toilet lookup failed: {exc}")
 
-        base = route_basename(city_start, city_end)
         known_tolls = toll_load("jumper_tolls.csv")
-        vignettes = vignette_load(args.vignettes_csv)
+        vignettes = vignette_load(vignettes_csv)
         route_colors = ["blue", "orange", "purple", "red"]
 
         primary_tolls = None
@@ -1704,8 +1899,8 @@ if __name__ == "__main__":
 
         print_route_cost_summary(route_costs)
 
-        if not args.no_map and not args.no_8a_resolve:
-            a8_cache = a8_cache_load(args.a8_cache)
+        if not no_map and not no_8a_resolve:
+            a8_cache = a8_cache_load(a8_cache_path)
             variants_for_names = [
                 outdoor_crags,
                 all_with_gyms,
@@ -1733,7 +1928,24 @@ if __name__ == "__main__":
                 resolve_8a_nu_url(
                     name, a8_cache, country_slug=country_slug, lat=lat, lon=lon)
 
-        if not args.no_map:
+        nearest_parking = {}
+        if not no_map and not no_parking:
+            if a8_cache is None:
+                a8_cache = a8_cache_load(a8_cache_path)
+            try:
+                highlighted = highlighted_outdoor_crags(
+                    outdoor_crags, a8_cache, geocode_cache)
+                p4n_crags = outdoor_crags_for_p4n_parking(
+                    outdoor_crags, a8_cache, geocode_cache, nearest_toilets)
+                n_toilet = len(nearest_toilets or {})
+                print(f"Beige crags: {len(highlighted)}, with OSM toilet: "
+                      f"{n_toilet}, unique for p4n lookup: {len(p4n_crags)}")
+                nearest_parking = nearest_parking_for_crags(p4n_crags)
+                print(f"Nearest parking found for {len(nearest_parking)} crags")
+            except requests.RequestException as exc:
+                print(f"Warning: park4night lookup failed: {exc}")
+
+        if not no_map:
             center_lat = (start_lat + end_lat) / 2
             center_lon = (start_lon + end_lon) / 2
             variants = [
@@ -1748,13 +1960,57 @@ if __name__ == "__main__":
                     start_lat, start_lon, end_lat, end_lon, city_start, city_end)
                 if idx == 0 and primary_tolls:
                     add_toll_markers(m, primary_tolls)
+                out_path = f"{base}_{suffix}.html"
                 build_and_save_map(
-                    m, locations, f"{base}_{suffix}.html",
+                    m, locations, out_path,
                     a8_cache=a8_cache, geocode_cache=geocode_cache,
-                    nearest_toilets=nearest_toilets)
+                    nearest_toilets=nearest_toilets,
+                    nearest_parking=nearest_parking)
+                paths.append(out_path)
 
-        save_crags_to_gpx(outdoor_crags, f"{base}_crags.gpx")
+        gpx_path = f"{base}_crags.gpx"
+        save_crags_to_gpx(outdoor_crags, gpx_path)
+        paths.append(gpx_path)
     finally:
-        geocode_cache_save(geocode_cache, args.geocode_cache)
+        geocode_cache_save(geocode_cache, geocode_cache_path)
         if a8_cache is not None:
-            a8_cache_save(a8_cache, args.a8_cache)
+            a8_cache_save(a8_cache, a8_cache_path)
+
+    return {"base": base, "paths": paths}
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Calculate toll cost between two cities using OSM data.")
+    parser.add_argument("start_city", help="Name of the start city")
+    parser.add_argument("end_city", help="Name of the end city")
+    parser.add_argument("--buffer", type=float, default=10,
+                        help="Buffer distance (km) around route for crag search")
+    parser.add_argument("--csv", default="tolls.csv",
+                        help="CSV file to store toll data")
+    parser.add_argument("--no-map", action="store_true",
+                        help="Disable map output")
+    parser.add_argument("--vignettes-csv", default="vignettes.csv",
+                        help="CSV file with per-country vignette prices")
+    parser.add_argument("--geocode-cache", default="geocode_cache.csv",
+                        help="CSV file to cache Nominatim reverse-geocode results")
+    parser.add_argument("--8a-cache", dest="a8_cache", default="8a_cache.csv",
+                        help="CSV file to cache 8a.nu URL lookups")
+    parser.add_argument("--no-8a-resolve", action="store_true",
+                        help="Skip 8a.nu search resolution; use search URLs only")
+    parser.add_argument("--no-toilets", action="store_true",
+                        help="Skip nearest-toilet lookup and map markers")
+    parser.add_argument("--no-parking", action="store_true",
+                        help="Skip park4night parking lookup")
+    args = parser.parse_args()
+
+    run_route(
+        args.start_city, args.end_city,
+        buffer_km=args.buffer,
+        vignettes_csv=args.vignettes_csv,
+        geocode_cache_path=args.geocode_cache,
+        a8_cache_path=args.a8_cache,
+        no_map=args.no_map,
+        no_8a_resolve=args.no_8a_resolve,
+        no_toilets=args.no_toilets,
+        no_parking=args.no_parking,
+    )
