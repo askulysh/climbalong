@@ -100,7 +100,49 @@ A8_COUNTRY_SLUG = {
 #routes = 3
 
 # === STEP 1: Geocode cities (Nominatim) ===
-def geocode(city_name):
+def _city_cache_key(city_name):
+    return re.sub(r"\s+", " ", city_name.strip()).casefold()
+
+
+def city_cache_load(csv_filename):
+    """Load forward-geocode cache keyed by normalized city name."""
+    cache = {}
+    if not os.path.exists(csv_filename):
+        return cache
+    with open(csv_filename, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                city = (row.get("city") or "").strip()
+                if not city:
+                    continue
+                lon = float(row["lon"])
+                lat = float(row["lat"])
+                cache[_city_cache_key(city)] = (lon, lat, city)
+            except (ValueError, KeyError):
+                continue
+    print(f"📂 Loaded {len(cache)} city locations from {csv_filename}")
+    return cache
+
+
+def city_cache_save(cache, csv_filename):
+    """Persist forward-geocode city locations to CSV."""
+    with open(csv_filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["city", "lon", "lat"])
+        writer.writeheader()
+        for key in sorted(cache):
+            lon, lat, city = cache[key]
+            writer.writerow({"city": city, "lon": lon, "lat": lat})
+    print(f"💾 City location cache saved: {csv_filename}")
+
+
+def geocode(city_name, city_cache=None):
+    """Forward-geocode a city name to (lon, lat). Uses city_cache when provided."""
+    key = _city_cache_key(city_name)
+    if city_cache is not None and key in city_cache:
+        lon, lat, _ = city_cache[key]
+        print(f"City cache hit: {city_name} → {lat:.4f},{lon:.4f}")
+        return lon, lat
     url = "https://nominatim.openstreetmap.org/search"
     params = {"q": city_name, "format": "json", "limit": 1}
     resp = requests.get(url, params=params,
@@ -109,7 +151,11 @@ def geocode(city_name):
     data = resp.json()
     if not data:
         raise ValueError(f"City not found: {city_name}")
-    return float(data[0]["lon"]), float(data[0]["lat"])
+    lon = float(data[0]["lon"])
+    lat = float(data[0]["lat"])
+    if city_cache is not None:
+        city_cache[key] = (lon, lat, city_name.strip())
+    return lon, lat
 
 
 def is_indoor_gym(tags):
@@ -1795,7 +1841,8 @@ def calc_toll_cost(route, fmap=None, known_tolls=None, label=None):
 
 
 def run_route(start_city, end_city, *, buffer_km=10, vignettes_csv="vignettes.csv",
-              geocode_cache_path="geocode_cache.csv", a8_cache_path="8a_cache.csv",
+              geocode_cache_path="geocode_cache.csv", city_cache_path="city_cache.csv",
+              a8_cache_path="8a_cache.csv",
               no_map=False, no_8a_resolve=False, no_toilets=False, no_parking=False):
     """Generate crag maps and GPX for a driving route between two cities.
 
@@ -1806,12 +1853,13 @@ def run_route(start_city, end_city, *, buffer_km=10, vignettes_csv="vignettes.cs
     search_buffer_km = buffer_km
 
     geocode_cache = geocode_cache_load(geocode_cache_path)
+    city_cache = city_cache_load(city_cache_path)
     a8_cache = None
     paths = []
     base = route_basename(city_start, city_end)
     try:
-        start_lon, start_lat = geocode(city_start)
-        end_lon, end_lat = geocode(city_end)
+        start_lon, start_lat = geocode(city_start, city_cache)
+        end_lon, end_lat = geocode(city_end, city_cache)
         print(f"Route: {city_start} → {city_end}")
 
         # === STEP 2: Get route polyline via OSRM ===
@@ -1973,6 +2021,7 @@ def run_route(start_city, end_city, *, buffer_km=10, vignettes_csv="vignettes.cs
         paths.append(gpx_path)
     finally:
         geocode_cache_save(geocode_cache, geocode_cache_path)
+        city_cache_save(city_cache, city_cache_path)
         if a8_cache is not None:
             a8_cache_save(a8_cache, a8_cache_path)
 
@@ -1993,6 +2042,8 @@ if __name__ == "__main__":
                         help="CSV file with per-country vignette prices")
     parser.add_argument("--geocode-cache", default="geocode_cache.csv",
                         help="CSV file to cache Nominatim reverse-geocode results")
+    parser.add_argument("--city-cache", default="city_cache.csv",
+                        help="CSV file to cache Nominatim city location lookups")
     parser.add_argument("--8a-cache", dest="a8_cache", default="8a_cache.csv",
                         help="CSV file to cache 8a.nu URL lookups")
     parser.add_argument("--no-8a-resolve", action="store_true",
@@ -2008,6 +2059,7 @@ if __name__ == "__main__":
         buffer_km=args.buffer,
         vignettes_csv=args.vignettes_csv,
         geocode_cache_path=args.geocode_cache,
+        city_cache_path=args.city_cache,
         a8_cache_path=args.a8_cache,
         no_map=args.no_map,
         no_8a_resolve=args.no_8a_resolve,
