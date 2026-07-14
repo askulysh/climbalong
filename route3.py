@@ -15,23 +15,22 @@ import argparse
 import time
 import unicodedata
 import math
+import json
 
 # === CONFIGURATION ===
-#city_start = "Chernivtsi, Ukraine"
-city_start = "Giurgiu"
-#city_start = "Arta, Greece"
-#city_start ="Athens, Greece"
-#city_end = "Paradisos, Greece"
-#city_start = "Paradisos, Greece"
-city_end = "Leonidio, Greece"
-#city_end = "Antalya"
-#city_end = "Arco"
-#city_end = "Giurgiu"
-#city_end = "Chernivtsi, Ukraine"
 buffer_km = 10  # default distance around route to search for crags (km)
 max_distance_m = 10
-consumption = 7.5
-fuel_cost = 1.4
+
+
+def _load_car_config(path=None):
+    if path is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "car.json")
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return float(data["consumption"]), float(data["fuel_cost"])
+
+
+consumption, fuel_cost = _load_car_config()
 
 CRAG_SEGMENT_KM = 250
 OVERPASS_URLS = [
