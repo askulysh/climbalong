@@ -18,6 +18,12 @@ from route3 import run_route
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CRAGS_HTML_RE = re.compile(r"^(.+)_crags\.html$")
+ROUTE_SUFFIXES = (
+    "_crags.html",
+    "_crags_gym.html",
+    "_crags_known.html",
+    "_crags.gpx",
+)
 GENERATE_LOCK = threading.Lock()
 CERT_PATH = os.path.join(ROOT, "cert.pem")
 KEY_PATH = os.path.join(ROOT, "key.pem")
@@ -46,6 +52,30 @@ def route_labels(base):
     return base, ""
 
 
+def route_files(base):
+    return [f"{base}{s}" for s in ROUTE_SUFFIXES]
+
+
+def safe_route_base(base):
+    """Return base if it is a known prepared route basename, else None."""
+    if not base or "/" in base or "\\" in base or ".." in base:
+        return None
+    return base if base in discover_routes() else None
+
+
+def delete_route_files(base):
+    """Remove HTML/GPX files for a route under ROOT. Returns deleted names."""
+    deleted = []
+    for name in route_files(base):
+        if "/" in name or "\\" in name or ".." in name:
+            continue
+        path = os.path.join(ROOT, name)
+        if os.path.isfile(path):
+            os.unlink(path)
+            deleted.append(name)
+    return deleted
+
+
 def index_html(routes, error=None, busy=False):
     rows = []
     for base in routes:
@@ -64,14 +94,25 @@ def index_html(routes, error=None, busy=False):
         if os.path.isfile(os.path.join(ROOT, gpx)):
             links.append(f'<a href="/{quote(gpx)}">gpx</a>')
         label = html.escape(f"{start} → {end}" if end else start)
+        safe_base = html.escape(base, quote=True)
+        actions = (
+            f'<form class="inline" method="post" action="/regenerate">'
+            f'<input type="hidden" name="base" value="{safe_base}">'
+            f'<button type="submit">Regenerate</button></form> '
+            f'<form class="inline" method="post" action="/delete">'
+            f'<input type="hidden" name="base" value="{safe_base}">'
+            f'<button type="submit" class="danger" '
+            f"onclick=\"return confirm('Delete this route?')\">Delete</button></form>"
+        )
         rows.append(
-            f"<tr><td>{label}</td><td>{' · '.join(links)}</td></tr>"
+            f"<tr><td>{label}</td><td>{' · '.join(links)}</td>"
+            f"<td>{actions}</td></tr>"
         )
 
-    empty_row = '<tr><td colspan="2">No prepared routes yet.</td></tr>'
+    empty_row = '<tr><td colspan="3">No prepared routes yet.</td></tr>'
     body_rows = "".join(rows) if rows else empty_row
     routes_section = (
-        "<table><thead><tr><th>Route</th><th>Maps</th></tr></thead>"
+        "<table><thead><tr><th>Route</th><th>Maps</th><th>Actions</th></tr></thead>"
         f"<tbody>{body_rows}</tbody></table>"
     )
 
@@ -94,12 +135,15 @@ def index_html(routes, error=None, busy=False):
     h1 {{ font-size: 1.5rem; }}
     h2 {{ font-size: 1.15rem; margin-top: 2rem; }}
     table {{ border-collapse: collapse; width: 100%; }}
-    th, td {{ text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #ddd; }}
-    form {{ display: grid; gap: 0.75rem; max-width: 24rem; }}
+    th, td {{ text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #ddd; vertical-align: middle; }}
+    form.gen {{ display: grid; gap: 0.75rem; max-width: 24rem; }}
+    form.inline {{ display: inline; }}
+    form.inline button {{ margin: 0.1rem 0; }}
     label {{ display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.9rem; }}
     label.check {{ flex-direction: row; align-items: center; gap: 0.5rem; }}
     input[type="text"], input[type="number"] {{ padding: 0.35rem 0.5rem; font-size: 1rem; }}
-    button {{ width: fit-content; padding: 0.45rem 1rem; font-size: 1rem; cursor: pointer; }}
+    button {{ width: fit-content; padding: 0.35rem 0.75rem; font-size: 0.9rem; cursor: pointer; }}
+    button.danger {{ color: #a30; }}
     .error {{ background: #fde8e8; padding: 0.75rem; overflow-x: auto; }}
     .busy {{ color: #a30; font-weight: 600; }}
     .hint {{ color: #555; font-size: 0.85rem; }}
@@ -114,7 +158,7 @@ def index_html(routes, error=None, busy=False):
 
   <h2>Generate a new route</h2>
   <p class="hint">Generation may take several minutes (OSRM, Overpass, optional 8a/toilets/parking).</p>
-  <form method="post" action="/generate">
+  <form class="gen" method="post" action="/generate">
     <label>Start city
       <input type="text" name="start" required placeholder="e.g. Lviv">
     </label>
@@ -147,56 +191,31 @@ class RouteHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=ROOT, **kwargs)
 
-    def do_GET(self):
-        if self.path in ("/", "/index.html"):
-            body = index_html(discover_routes()).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        return super().do_GET()
-
-    def do_POST(self):
-        if self.path.rstrip("/") != "/generate":
-            self.send_error(404, "Not found")
-            return
-
+    def _read_form(self):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length).decode("utf-8", errors="replace")
-        form = parse_qs(raw)
+        return parse_qs(raw)
 
-        start = (form.get("start") or [""])[0].strip()
-        end = (form.get("end") or [""])[0].strip()
-        try:
-            buffer_km = float((form.get("buffer") or ["10"])[0] or 10)
-        except ValueError:
-            buffer_km = 10.0
-        no_8a = "no_8a_resolve" in form
-        no_toilets = "no_toilets" in form
-        no_parking = "no_parking" in form
+    def _send_html(self, status, body_bytes):
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body_bytes)))
+        self.end_headers()
+        self.wfile.write(body_bytes)
 
-        if not start or not end:
-            body = index_html(
-                discover_routes(), error="Start and end cities are required."
-            ).encode("utf-8")
-            self.send_response(400)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
+    def _redirect(self, location):
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.end_headers()
 
+    def _run_generate(self, start, end, buffer_km=10.0,
+                      no_8a=False, no_toilets=False, no_parking=False):
         if not GENERATE_LOCK.acquire(blocking=False):
-            body = index_html(discover_routes(), busy=True).encode("utf-8")
-            self.send_response(503)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_html(
+                503,
+                index_html(discover_routes(), busy=True).encode("utf-8"),
+            )
             return
-
         try:
             result = run_route(
                 start, end,
@@ -205,21 +224,102 @@ class RouteHandler(SimpleHTTPRequestHandler):
                 no_toilets=no_toilets,
                 no_parking=no_parking,
             )
-            target = f"/{result['base']}_crags.html"
-            self.send_response(302)
-            self.send_header("Location", target)
-            self.end_headers()
+            self._redirect(f"/{result['base']}_crags.html")
         except Exception:
             err = traceback.format_exc()
             print(err, file=sys.stderr)
-            body = index_html(discover_routes(), error=err).encode("utf-8")
-            self.send_response(500)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_html(
+                500,
+                index_html(discover_routes(), error=err).encode("utf-8"),
+            )
         finally:
             GENERATE_LOCK.release()
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            self._send_html(200, index_html(discover_routes()).encode("utf-8"))
+            return
+        return super().do_GET()
+
+    def do_POST(self):
+        path = self.path.rstrip("/")
+        form = self._read_form()
+
+        if path == "/generate":
+            start = (form.get("start") or [""])[0].strip()
+            end = (form.get("end") or [""])[0].strip()
+            try:
+                buffer_km = float((form.get("buffer") or ["10"])[0] or 10)
+            except ValueError:
+                buffer_km = 10.0
+            if not start or not end:
+                self._send_html(
+                    400,
+                    index_html(
+                        discover_routes(),
+                        error="Start and end cities are required.",
+                    ).encode("utf-8"),
+                )
+                return
+            self._run_generate(
+                start, end,
+                buffer_km=buffer_km,
+                no_8a="no_8a_resolve" in form,
+                no_toilets="no_toilets" in form,
+                no_parking="no_parking" in form,
+            )
+            return
+
+        if path == "/regenerate":
+            base = safe_route_base((form.get("base") or [""])[0].strip())
+            if not base:
+                self._send_html(
+                    400,
+                    index_html(
+                        discover_routes(),
+                        error="Unknown route to regenerate.",
+                    ).encode("utf-8"),
+                )
+                return
+            start, end = route_labels(base)
+            if not end:
+                self._send_html(
+                    400,
+                    index_html(
+                        discover_routes(),
+                        error=f"Cannot parse start/end from basename {base!r}.",
+                    ).encode("utf-8"),
+                )
+                return
+            try:
+                buffer_km = float((form.get("buffer") or ["10"])[0] or 10)
+            except ValueError:
+                buffer_km = 10.0
+            self._run_generate(
+                start, end,
+                buffer_km=buffer_km,
+                no_8a="no_8a_resolve" in form,
+                no_toilets="no_toilets" in form,
+                no_parking="no_parking" in form,
+            )
+            return
+
+        if path == "/delete":
+            base = safe_route_base((form.get("base") or [""])[0].strip())
+            if not base:
+                self._send_html(
+                    400,
+                    index_html(
+                        discover_routes(),
+                        error="Unknown route to delete.",
+                    ).encode("utf-8"),
+                )
+                return
+            delete_route_files(base)
+            self._redirect("/")
+            return
+
+        self.send_error(404, "Not found")
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
