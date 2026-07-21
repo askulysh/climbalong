@@ -306,14 +306,30 @@ def _norm_crag_name(name):
     return re.sub(r"\s+", " ", s).strip().casefold()
 
 
+_CRAG_NAME_NOISE = re.compile(r"\b(klettergarten|falesia)\b", re.I)
+
+
+def _strip_crag_name_noise(s):
+    cleaned = _CRAG_NAME_NOISE.sub("", s)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -/").strip()
+    return cleaned
+
+
 def _a8_search_name(name):
-    """Strip OSM 'sector ' prefix before 8a.nu search/match."""
+    """Normalize OSM crag name before 8a.nu / TheCrag search."""
     if not name:
         return name
     s = name.strip()
-    if re.match(r"^sector\s+", s, re.I):
-        return re.sub(r"^sector\s+", "", s, count=1, flags=re.I).strip()
-    return s
+    s = re.sub(r"^sector\s+", "", s, count=1, flags=re.I).strip()
+    parts = re.split(r"\s+[-/]\s+", s)
+    if len(parts) >= 2:
+        cores = [_strip_crag_name_noise(p) for p in parts]
+        cores = [c for c in cores if c]
+        if cores and len({_norm_crag_name(c) for c in cores}) == 1:
+            return cores[0]
+    cleaned = _strip_crag_name_noise(s)
+    return cleaned or s
+
 
 
 def _slugify(name):
@@ -598,7 +614,7 @@ def _outdoor_crag_urls(name, tags, a8_cache, lon=None, lat=None,
     """Return (thecrag_url, a8nu_url, a8_entry) for popup links."""
     thecrag_url = thecrag_url_from_tags(tags)
     if name and not thecrag_url:
-        query_name = urllib.parse.quote(name)
+        query_name = urllib.parse.quote(_a8_search_name(name))
         thecrag_url = f"https://www.thecrag.com/search?S={query_name}#crags"
     a8nu_url = None
     a8_entry = None
